@@ -503,6 +503,14 @@ if __name__ == '__main__':
             image = Image.open(args.input_image)
             print(f"Loaded image: {args.input_image}")
         
+        # texgen のロードに失敗したまま --texture を続行すると、テクスチャなしの
+        # メッシュを「成功」として出力し、終了コード0で終わってしまう。
+        # 計測スクリプトはこれを成功と記録するため、ここで明示的に失敗させる。
+        if args.texture and not HAS_TEXTUREGEN:
+            print("\n❌ --texture が指定されましたが、テクスチャ生成モデルをロードできませんでした。")
+            print("   上のログの 'Failed to load texture generator.' とその直前の例外を確認してください。")
+            sys.exit(1)
+
         # 3D生成を実行
         if args.texture:
             # テクスチャ付き生成（generation_all使用）
