@@ -17,10 +17,10 @@ variable "region" {
   default     = "asia-southeast1"
 }
 
-variable "budget_amount_usd" {
-  description = "月額予算（USD）。超過してもリソースは止まらず、通知が飛ぶだけ"
+variable "budget_amount" {
+  description = "月額予算。通貨は請求先アカウントに従う（このアカウントは JPY）。超過してもリソースは止まらず、通知が飛ぶだけ"
   type        = number
-  default     = 50
+  default     = 5000
 }
 
 variable "image" {

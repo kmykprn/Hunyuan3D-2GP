@@ -15,10 +15,12 @@ resource "google_billing_budget" "monthly" {
     projects = ["projects/${data.google_project.this.number}"]
   }
 
+  # currency_code は指定しない。指定すると請求先アカウントの通貨と一致する
+  # 必要があり、違うと 400 INVALID_ARGUMENT で弾かれる（原因が出ないので
+  # 分かりにくい）。省略すればアカウントの通貨がそのまま使われる。
   amount {
     specified_amount {
-      currency_code = "USD"
-      units         = tostring(var.budget_amount_usd)
+      units = tostring(var.budget_amount)
     }
   }
 
