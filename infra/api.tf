@@ -60,6 +60,20 @@ resource "google_cloud_run_v2_service" "api" {
         value = google_storage_bucket.outputs.name
       }
 
+      # 起動するジョブの場所。run.googleapis.com を直接叩くのに要る
+      env {
+        name  = "PROJECT_ID"
+        value = var.project_id
+      }
+      env {
+        name  = "REGION"
+        value = var.region
+      }
+      env {
+        name  = "JOB_NAME"
+        value = "hunyuan3d-measure"
+      }
+
       resources {
         limits = {
           cpu    = "1"
@@ -83,4 +97,22 @@ resource "google_cloud_run_v2_service_iam_member" "api_invoker" {
   location = var.region
   role     = "roles/run.invoker"
   member   = "user:${var.operator_email}"
+}
+
+# ジョブを起動するのに要る。
+#
+# roles/run.invoker では足りない（あれはサービスを呼ぶ権限）。
+# ジョブの実行は run.jobs.run で、developer に含まれる
+resource "google_project_iam_member" "api_runs_jobs" {
+  project = var.project_id
+  role    = "roles/run.developer"
+  member  = "serviceAccount:${google_service_account.api.email}"
+}
+
+# 起動したジョブは GPU ジョブ用のサービスアカウントで動く。
+# 別のSAとしてジョブを動かすには、その SA を「使う」権限が要る
+resource "google_service_account_iam_member" "api_acts_as_job" {
+  service_account_id = google_service_account.job.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.api.email}"
 }

@@ -71,6 +71,10 @@ RUN grep -v '^diso$' requirements.txt > /tmp/req.txt \
  && pip install -r /tmp/req.txt \
  && pip install --no-build-isolation diso
 
+# worker_entrypoint.py が入出力を GCS API で行うのに要る。
+# requirements.txt には無い（生成そのものには不要なため）
+RUN pip install google-cloud-storage
+
 # 拡張のソースだけ先に入れてビルドする。
 # こうしておくと、アプリのコードを直してもこの重い層が再利用される
 COPY hy3dgen/texgen/custom_rasterizer       hy3dgen/texgen/custom_rasterizer

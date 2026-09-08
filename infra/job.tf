@@ -100,15 +100,16 @@ resource "google_cloud_run_v2_job" "measure" {
             # 6144 にしたところ、アプリ側と合わせて 16GiB を超えて OOM で
             # 落ちた（テクスチャ側は paint と delight の2本がロードされる）
             "file-cache-max-size-mb=4096",
-            # 範囲読みでもファイル全体をキャッシュに載せる。既定は false で、
-            # その場合レンジリクエストはキャッシュを素通りして低速パスに落ちる。
-            # diffusers は .bin (zip) を範囲読みするため、これが効く可能性が高い。
+            # file-cache-cache-file-for-range-read は付けない。
+            # 打ち手3として試したが 533秒 → 531秒 で効果が無く、一方で
+            # 範囲読みのたびにファイル全体をキャッシュに載せるためメモリを
+            # 余計に使う。メモリ使用率は実測で平均83.6%・ピークで上限到達
+            # しており、効果の無いものに割ける余裕がない。
             #
             # なお download-chunk-size-mb と parallel-downloads-per-file を
-            # 同時に引き上げたところ OOM で落ちた。これらのバッファは
+            # 同時に引き上げたときも OOM した。これらのバッファは
             # file-cache-max-size-mb とは別枠でメモリを食う
             # (512MB × 32並列 = 最大16GB)ので、既定のままにしておく
-            "file-cache-cache-file-for-range-read=true",
             # 大きなファイルの初回読み込みを並列化する
             "file-cache-enable-parallel-downloads=true",
             # 重みは実行中に変わらないので、メタデータは無期限にキャッシュしてよい
@@ -128,6 +129,7 @@ resource "google_cloud_run_v2_job" "measure" {
           size_limit = "4Gi"
         }
       }
+
 
       containers {
         image = var.image
@@ -153,6 +155,14 @@ resource "google_cloud_run_v2_job" "measure" {
           value = "/tmp/hf_modules"
         }
 
+        # 生成物と状態の置き場。gcsfuse でマウントせず GCS API で読み書きする。
+        # マウントを2つにすると 16GiB を超えて OOM した（キャッシュが4GiBを
+        # 占めており、マウント1つ分の余裕しか無い）
+        env {
+          name  = "OUTPUTS_BUCKET"
+          value = google_storage_bucket.outputs.name
+        }
+
 
         volume_mounts {
           name       = "weights"
@@ -175,13 +185,9 @@ resource "google_cloud_run_v2_job" "measure" {
           }
         }
 
-        args = [
-          "python", "minimal_demo_mmgp.py",
-          "--input-image", "assets/example_images/052.png",
-          "--output", "/tmp/output",
-          "--texture",
-          "--profile", "3",
-        ]
+        # 入力画像は API が GCS に置き、JOB_ID で場所を伝える。
+        # 固定の画像を生成していた計測用の指定は worker_entrypoint.py に移した
+        args = ["python", "worker_entrypoint.py"]
       }
     }
   }
