@@ -13,3 +13,9 @@ budget_amount = 5000
 
 # Artifact Registry に push したイメージ。最初の apply では空のままでよい
 # image = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/hunyuan3d:v1"
+
+# API を叩く運用者のGoogleアカウント（段階3まではこの人だけが呼べる）
+operator_email = "you@example.com"
+
+# API層のイメージ。push 前は空のままでよい
+# api_image = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/api:v1"

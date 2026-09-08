@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+google-cloud-storage
+google-auth
+python-multipart
+
+# firebase-admin は段階3で足す。段階1・2は Cloud Run の IAM で閉じており、
+# アプリケーション側の認証コードを書かない

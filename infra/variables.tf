@@ -37,3 +37,14 @@ variable "job_timeout_seconds" {
   type        = number
   default     = 1800
 }
+
+variable "api_image" {
+  description = "API層のコンテナイメージ。push 前は空にしておき、サービスを作らせない"
+  type        = string
+  default     = ""
+}
+
+variable "operator_email" {
+  description = "API を叩く運用者のGoogleアカウント。段階3で allUsers を許可するまで、この人だけが呼べる"
+  type        = string
+}
