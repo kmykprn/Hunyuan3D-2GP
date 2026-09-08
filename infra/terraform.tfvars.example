@@ -1,0 +1,14 @@
+# コンソールで作成したプロジェクトのID
+project_id = "your-project-id"
+
+# 請求先アカウントID。`gcloud billing accounts list` で確認できる
+billing_account = "01A2B3-C4D5E6-F7890A"
+
+# L4 は東京に無い。シンガポールかムンバイ
+region = "asia-southeast1"
+
+# 月額予算（USD）。超過しても止まらず、通知が飛ぶだけ
+budget_amount_usd = 50
+
+# Artifact Registry に push したイメージ。最初の apply では空のままでよい
+# image = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/hunyuan3d:v1"

@@ -1,0 +1,8 @@
+# 状態ファイルにはリソースの詳細が入り、機密が含まれうる。絶対にコミットしない
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# 実際の値（プロジェクトID・請求先アカウント）が入るファイル
+terraform.tfvars

@@ -1,0 +1,40 @@
+# Hunyuan3D-2GP を Cloud Run(GPU) で動かすためのインフラ定義。
+#
+# ここで作るものは「まず実測するため」の最小構成。
+# コールドスタートと L4 での生成時間という2つの推定値を確定させるのが目的で、
+# 本番のAPI層（Cloud Run CPU + Cloud Tasks + Firestore）はまだ含まない。
+#
+# 使い方は README.md を参照。
+
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 8.1"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# 使う API を明示的に有効化する。
+#
+# disable_on_destroy を false にしているのは、terraform destroy のたびに
+# API が無効化されると、他のリソースの削除自体が失敗しうるため。
+# API を有効にしておくこと自体に費用は発生しない。
+resource "google_project_service" "required" {
+  for_each = toset([
+    "run.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "storage.googleapis.com",
+    "billingbudgets.googleapis.com",
+    "cloudbilling.googleapis.com",
+  ])
+
+  service            = each.value
+  disable_on_destroy = false
+}
