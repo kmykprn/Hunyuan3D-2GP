@@ -1,71 +1,71 @@
-# Hunyuan3D-2GP を Cloud Run(GPU) で動かすためのイメージ。
+# Hunyuan3D-2GP を Cloud Run(GPU) で動かすためのイメージ（マルチステージ）。
 #
-# 設計の要点:
-#   - CUDA拡張のビルドに nvcc が要るため devel イメージを使う（runtime では nvcc が無い）
-#   - モデルの重み 20GB はイメージに入れない。10GB を超えると Cloud Run の
-#     イメージストリーミングがかえって遅くなるため、実行時に外から与える
-#   - torch を requirements.txt より先に固定版で入れる。requirements.txt の
-#     torch はバージョン未指定なので、後から入れると別のCUDA版が来て拡張が壊れる
+# 構成:
+#   builder（devel）で CUDA拡張をビルドし、出来上がった venv だけを
+#   runtime へ移す。nvcc が要るのはビルドの一瞬だけなので、
+#   CUDAツールキット一式を最終イメージに持ち込まない。
+#
+# 実測: 14.6GB → 9.47GB（-35%）。生成結果・各工程の所要時間は単一ステージ版と同じ。
+#   内訳の変化は CUDAベース層 4.98GB(devel) → 2.05GB(runtime) が主。
+#
+# なぜ小さくするのか（※コールドスタートのためではない）:
+#   - Artifact Registry の保管費が減る（$0.10/GB/月）
+#   - ビルドと push が速くなる
+#   - runtime にコンパイラを置かないので、攻撃面が小さい
+#
+#   Cloud Run のイメージストリーミングは「起動に必要なブロックだけ」を取るため、
+#   イメージが大きいこと自体は起動時間にほとんど効かない。
+#   公式ガイドが挙げる 10GB の閾値は「モデルの重みをイメージに焼き込んでよいか」
+#   の基準であって、イメージ全体のサイズの基準ではない。
+#   https://docs.cloud.google.com/run/docs/configuring/services/gpu-best-practices
+#
+# モデルの重み 20GB はこのイメージに入っていない。実行時に外から与える（DOCKER.md 参照）。
 
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+# ══════════════════════════════════════════════════════
+# builder ── nvcc が要る作業をここで全部やる
+# ══════════════════════════════════════════════════════
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Ubuntu 22.04 の標準 Python は 3.10 系で、README が指定する 3.10.9 と同系列。
-#
-# libgl1 / libglib2.0-0 は opencv が必要とする。
-# libopengl0（libOpenGL.so.0）は pymeshlab のプラグインが必要とする。
-# libgl1 が入れる libGL.so.1 とは別物で、欠けていると libio_base.so の
-# ロードに失敗し、対応形式がひとつも登録されないまま
-# `Unknown format for load: ply` として表面化する。
-# 面数削減の処理で初めて踏むため、モデルのロードまでは成功して見える
+# python3.10-venv は Ubuntu が ensurepip を別パッケージに切り出しているため必要。
+# 無いと `python -m venv` が「ensurepip is not available」で失敗する
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.10 python3.10-dev python3-pip \
+      python3.10 python3.10-dev python3.10-venv python3-pip \
       build-essential git \
-      libgl1 libopengl0 libglib2.0-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3.10 /usr/bin/python \
-    && python -m pip install --upgrade pip
+# 成果物を1本のディレクトリにまとめる。こうしないと pip の入れた物が
+# /usr/lib/python3/dist-packages と /usr/local/lib/... に散らばり、
+# 次のステージへ「必要な物だけ」を移せない
+RUN python3.10 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+RUN pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
 
-# README と同じ取得元・同じバージョンにそろえる。
-# ローカルで動作確認できている組み合わせから離れないことを優先する
-RUN pip install torch==2.5.1 torchvision torchaudio \
+# torchaudio は入れない。リポジトリ全体で import している箇所がひとつも無く、
+# CUDA カーネルを抱えたぶんだけイメージが太る。
+RUN pip install torch==2.5.1 torchvision \
       --index-url https://download.pytorch.org/whl/test/cu124
 
 # --- CUDA拡張のビルド設定 ---
-# diso と後段の custom_rasterizer は、どちらもここでの設定に従ってコンパイルされる。
-#
-# nvidia/cuda の devel イメージは nvcc を PATH に置くが CUDA_HOME は空のままで、
-# setup.py 側はこれを見て include パスを組み立てるため、指定しないと
-# `fatal error: cuda_runtime.h: No such file or directory` で落ちる。
+# devel イメージは nvcc を PATH に置くが CUDA_HOME は空のままで、
+# 指定しないと cuda_runtime.h が見つからず落ちる
 ENV CUDA_HOME=/usr/local/cuda
-# diso は `torch.cuda.is_available() and CUDA_HOME is not None` で CUDA版か
-# CPU版かを決める。docker build 中はGPUが見えず前者が False になるため、
-# 放っておくと CppExtension でビルドされ、ソースが include する
-# cuda_runtime.h が見つからず落ちる。FORCE_CUDA はそのための脱出口。
+# ビルド中はGPUが見えず torch.cuda.is_available() が False になるため、
+# 放っておくと diso が CPU版としてビルドされて失敗する
 ENV FORCE_CUDA=1
-# ビルド時にGPUは見えないため、対象アーキテクチャを明示しないと
-# setup.py が実機を検出しようとして失敗する。
-# 8.9 = Ada Lovelace。RTX 4070（ローカル）と L4（Cloud Run）の両方が該当する。
-# 別世代のGPUで動かすときはここを変える（例: A100 は 8.0、H100 は 9.0）
+# 8.9 = Ada Lovelace。RTX 4070（ローカル）と L4（Cloud Run）の両方が該当する
 ENV TORCH_CUDA_ARCH_LIST="8.9"
-
-# diso と CUDA拡張は --no-build-isolation でビルドするため、
-# ビルド用のツールがイメージ側に存在している必要がある。
-# requirements.txt の依存の副作用に任せると、上流の変更で静かに壊れる
-RUN pip install setuptools wheel
 
 COPY requirements.txt .
 
-# diso は setup.py の中で torch を import するのに、それを
-# build-system.requires に宣言していない。pip は PEP 517 の分離環境で
-# wheel を作るので、torch を先に入れてあってもその環境からは見えず、
-# 必ず ModuleNotFoundError: No module named 'torch' で落ちる。
+# diso は setup.py の中で torch を import するのに build-system.requires に
+# 宣言していないため、PEP 517 の分離環境からは torch が見えない。
 # diso だけ分けて --no-build-isolation で入れる
 RUN grep -v '^diso$' requirements.txt > /tmp/req.txt \
  && pip install -r /tmp/req.txt \
@@ -76,20 +76,41 @@ RUN grep -v '^diso$' requirements.txt > /tmp/req.txt \
 COPY hy3dgen/texgen/custom_rasterizer       hy3dgen/texgen/custom_rasterizer
 COPY hy3dgen/texgen/differentiable_renderer hy3dgen/texgen/differentiable_renderer
 
-# README は `python setup.py install` と書いているが、setuptools 80 以降で
-# このコマンドは削除されている。新規に入る setuptools では失敗しうるため
-# 同等の `pip install .` を使う。
-# --no-build-isolation が必須: これらの拡張は setup.py の中で torch を import する。
-# 分離環境でビルドすると torch が無く、必ず失敗する。
+# --no-build-isolation が必須（拡張は setup.py の中で torch を import する）
 RUN pip install --no-build-isolation ./hy3dgen/texgen/custom_rasterizer \
  && pip install --no-build-isolation ./hy3dgen/texgen/differentiable_renderer
 
+# ══════════════════════════════════════════════════════
+# runtime ── nvcc もコンパイラも持たない、実行だけの層
+# ══════════════════════════════════════════════════════
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+# python3.10 は venv の実体（/opt/venv/bin/python は /usr/bin/python3.10 への
+# シンボリックリンク）なので、runtime 側にも同じパスで必要。
+# python3.10-dev / build-essential / pip はビルド専用なので入れない。
+#
+# libgl1 / libglib2.0-0 は opencv、libopengl0 は pymeshlab のプラグインが必要とする。
+# libopengl0 が欠けると、面数削減の段で `Unknown format for load: ply` として
+# 表面化する（形状生成までは成功して見えるので原因が遠い）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.10 \
+      libgl1 libopengl0 libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3.10 /usr/bin/python
+
+# builder の成果物はこの1本だけ。CUDAツールキットもコンパイラも持ってこない
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+WORKDIR /app
 COPY . .
 
-# 重みの置き場所。ローカルでは既存の HuggingFace キャッシュを、
-# Cloud Run では GCS から落としたディレクトリをここにマウントする。
-# HF_HOME 配下の hub/ をそのまま使うので、~/.cache/huggingface を丸ごと渡せばよい
+# 重みの置き場所。ローカルではホストの HuggingFace キャッシュを、
+# Cloud Run では GCS から落としたディレクトリをここにマウントする
 ENV HF_HOME=/models
 
-# 既定は使い方の表示。実際の実行はコマンドを上書きして行う（DOCKER.md 参照）
 CMD ["python", "minimal_demo_mmgp.py"]
