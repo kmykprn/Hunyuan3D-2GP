@@ -40,6 +40,9 @@ resource "google_project_service" "required" {
     "storage.googleapis.com",
     "billingbudgets.googleapis.com",
     "cloudbilling.googleapis.com",
+    # job.tf がジョブ用のサービスアカウントを作るのに要る。
+    # 無いと google_service_account の作成が accessNotConfigured で落ちる
+    "iam.googleapis.com",
   ])
 
   service            = each.value

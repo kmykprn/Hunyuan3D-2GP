@@ -9,6 +9,11 @@
 resource "google_service_account" "job" {
   account_id   = "hunyuan3d-job"
   display_name = "Hunyuan3D 実測ジョブ"
+
+  # iam.googleapis.com の有効化を待つ。これが無いと新規プロジェクトへの
+  # 初回 apply で、API有効化と並行して作成が走り accessNotConfigured で落ちる。
+  # 2回目の apply では通ってしまうので、一度動いた環境では気づけない
+  depends_on = [google_project_service.required]
 }
 
 # 重みの読み出しと生成物の書き込みだけを許可する。
