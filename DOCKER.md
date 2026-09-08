@@ -78,17 +78,24 @@ Cloud Run での見積もりの土台が固くなる。
 | **面数削減で `Unknown format for load: ply`** | `libopengl0` の欠落。`libgl1` が入れる `libGL.so.1` とは別物で、無いと pymeshlab のプラグインが全滅し対応形式がひとつも登録されない。**モデルのロードと形状生成は成功して見えるため原因が遠い** |
 | 拡張のビルドが `setup.py install is deprecated` で止まる | Dockerfile では `pip install .` を使っている。もし `setup.py install` に戻すなら `pip install "setuptools<80"` で固定する |
 | モデルのダウンロードが始まる | マウント先が違う。`HF_HOME=/models` なので `~/.cache/huggingface` を `/models` に渡す |
+| builder で `ensurepip is not available` | `python3.10-venv` の入れ忘れ。venv を作るのに必要 |
+| runtime で共有ライブラリが足りない | 実測では起きなかった。torch が `nvidia-*-cu12` を venv 内に同梱するため、CUDAランタイムは venv ごと運ばれる。もし起きたら両ステージで `ldd` を取って差分を見る |
 
 ## 重みをイメージに入れていない理由
 
 重みは約20GB（形状 7.2GB ＋ テクスチャ 12.7GB）ある。
 
-Cloud Run のイメージストリーミングは **10GB 未満のモデルでは有効**だが、
-それを超えると取り込みとストリーミングのオーバーヘッドがボトルネックになる。
-20GB はその領域なので、イメージから出して実行時に与える。
+Cloud Run の公式ガイドは、**モデルの重みが 10GB 未満ならイメージに焼き込んでよい**が、
+それを超えるものは Cloud Storage から `gcloud storage cp` で並列ダウンロードするのが
+最速だとしている。20GB はその領域なので、イメージから出して実行時に与える。
 
-副次的な利点として、**重みとコードのライフサイクルが分離される**。
-コードを1行直すたびに20GBのイメージを焼き直す必要がなくなり、開発中の反復が速い。
+> Google recommends downloading ML models from Cloud Storage (略), though you might
+> alternatively store models inside container images if they're smaller than 10 GB.
+> — [Best practices: AI inference on Cloud Run services with GPUs](https://docs.cloud.google.com/run/docs/configuring/services/gpu-best-practices)
+
+**ただし、これはまだ検証していない前提**。イメージに焼き込む案（`COPY` するだけで
+GCSバケットも権限も起動スクリプトも不要）のほうが、実装が小さいぶん先に試す価値がある。
+どちらが速いかは Cloud Run 上で実測して決める。
 
 ## 実測（2026-09-08）
 
@@ -104,26 +111,48 @@ RTX 4070 12GB / profile 3 / `assets/example_images/052.png`
 各工程の所要時間はホストとほぼ一致しており、**コンテナ化による速度低下はない**。
 全体の差（約26秒）はイメージの起動と重みの読み込み。
 
-### ⚠️ イメージサイズ 14.6GB（重みを含まない）
+### イメージサイズ 9.47GB（重みを含まない）
 
-重みを外に出したにもかかわらず、**イメージ単体で 10GB の閾値を超えている**。
-内訳の大半は CUDA の devel イメージ（ツールキット一式）と torch。
+マルチステージ化により **14.6GB → 9.47GB（-35%）**。生成結果と各工程の所要時間は
+単一ステージ版と変わらない（交互に2回ずつ実行して確認）。
 
-Cloud Run のイメージストリーミングは10GB未満で有効なので、このままでは
-重みを外に出した効果が薄れる。**マルチステージビルドが次の課題**。
-拡張を `devel` でビルドし、成果物だけ `runtime` イメージにコピーすれば、
-CUDAツールキット一式を落とせる。
+| 層 | before | after |
+|---|---|---|
+| CUDA ベース | 4.98GB（devel） | **2.05GB（runtime）** |
+| torch 系 | 5.42GB | 6.87GB（venv に統合、torchaudio 除去済み） |
+| requirements + diso | 1.45GB | （venv に含む） |
+| apt | 298MB | 230MB |
+
+**注意: これはコールドスタートのための最適化ではない。**
+Cloud Run のイメージストリーミングは「起動に必要なブロックだけ」を取るため、
+イメージが大きいこと自体は起動時間にほとんど効かない
+（公式ブログは「15GB の CUDA イメージでも小さなアプリ並みに起動する」としている）。
+削って得られるのは、Artifact Registry の保管費（$0.10/GB/月）、ビルドと push の速さ、
+runtime にコンパイラを置かないことによる攻撃面の縮小。
+
+**10GB という数字は「重みをイメージに焼き込んでよいか」の基準であって、
+イメージ全体のサイズの基準ではない。** 上の「重みをイメージに入れていない理由」を参照。
+
+### コンテナが root で動くこと
+
+`USER` を切っていないため、バインドマウントした `output/` や `gradio_cache/` の
+中身が root 所有になり、ホスト側から消せなくなる。当面はコンテナ経由で消すか、
+`docker run --user "$(id -u):$(id -g)"` を付ける。
+Cloud Run では実害がないので、`USER` を切るのは実機で確認できるときにまとめて行う。
 
 ## 次の段階（Cloud Run 向け）
 
 このイメージは CLI を動かすところまで。Cloud Run に載せるには以下が要る。
 
-0. **マルチステージビルドでイメージを削る** — 現状 14.6GB。10GB を切りたい
 1. **HTTPサーバ化** — `api_server.py` が既に `POST /send` → `GET /status/{uid}` を
-   実装しているので、これを起点にする
-2. **起動時に GCS から重みを落とす** — `gcloud storage cp --recursive` の並列ダウンロードが
-   大きな重みでは最速。Cloud Storage FUSE は初回ダウンロードを並列化しないため遅い
-3. **Cloud Run の設定** — L4 GPU、最低 4vCPU / 16GiB、同時実行数 1、スケールtoゼロ
+   実装しているので、これを起点にする。ただし mmgp を通していない点を含め、
+   そのままでは Cloud Run に載らない（`CLOUDRUN_MEASURE.md` の「次にやること」参照）
+2. **重みの供給方法を決める** — イメージに焼き込む案と GCS から落とす案があり、
+   どちらが速いかは未検証。実装が小さいのは焼き込む案
+3. **Cloud Run の設定** — L4 GPU、最低 4vCPU / 16GiB、同時実行数 1、スケールtoゼロ。
+   **L4 は東京(asia-northeast1)では使えない**。アジアは asia-southeast1（シンガポール）
+   または asia-south1（ムンバイ）
 
-順序としては、ローカルで 1 まで作って動作確認 → Cloud Run にデプロイして
-コールドスタートを含む実測、が安全。
+順序としては、1 を待たずに **今のイメージをそのまま Cloud Run Job としてデプロイする**のが
+最短。CLI が `CMD` になっているのでそのまま動き、コールドスタートと L4 での生成時間という
+一番大きな2つの未知数が、HTTPサーバを書く前に確定する。
