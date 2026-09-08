@@ -73,6 +73,50 @@ resource "google_cloud_run_v2_job" "measure" {
         gcs {
           bucket    = google_storage_bucket.weights.name
           read_only = true
+
+          # ファイルキャッシュを有効にする。既定では無効で、その状態だと
+          # diffusers の from_pretrained が致命的に遅い。
+          # 実測ではテクスチャモデルのロードに25分40秒かかり（約2.2MB/s）、
+          # 30分のタイムアウトに達して生成まで到達しなかった。
+          #
+          # 原因は safetensors の mmap で、ページフォルトが1回ずつ
+          # GCS へのレンジリクエストになること。gcsfuse からは
+          # ランダムアクセスに見えるため先読みが効かない。
+          # 同じ症状が gcsfuse#2828 と diffusers#10280 に報告されている。
+          #
+          # 対比として、形状モデル(7.2GB の単一 safetensors)は同じマウントを
+          # 通して67秒(110MB/s)で読めている。gcsfuse が一律に遅いのではなく、
+          # diffusers の読み方が問題という切り分けになる。
+          mount_options = [
+            # ファイルキャッシュは cache-dir を指定して初めて有効になる。
+            # サイズ上限だけ書いても有効化されず、gcsfuse が
+            # 「file cache should be enabled for parallel download support」
+            # で起動に失敗する。
+            # Cloud Run では in-memory ボリュームを cr-volume:{名前} で参照する
+            "cache-dir=cr-volume:cache",
+            # このキャッシュは各ファイルを1回しか読まないので、再利用のためでは
+            # なく「gcsfuse に並列ダウンロードさせる」ために置いている。
+            # よって必要なのは最大の単一ファイル(unet 3.41GB)が収まる大きさだけ。
+            # 6144 にしたところ、アプリ側と合わせて 16GiB を超えて OOM で
+            # 落ちた（テクスチャ側は paint と delight の2本がロードされる）
+            "file-cache-max-size-mb=4096",
+            # 大きなファイルの初回読み込みを並列化する
+            "file-cache-enable-parallel-downloads=true",
+            # 重みは実行中に変わらないので、メタデータは無期限にキャッシュしてよい
+            "metadata-cache-ttl-secs=-1",
+          ]
+        }
+      }
+
+      # 上の cache-dir が指す実体。Cloud Run にローカルディスクは無いので
+      # メモリ上に置くしかなく、その分はコンテナのメモリ上限(16GiB)に
+      # カウントされる。4GiB 使うと、アプリ側に残るのは約12GiB。
+      # 6GiB にしたときは OOM(signal 9)で落ちた
+      volumes {
+        name = "cache"
+        empty_dir {
+          medium     = "MEMORY"
+          size_limit = "4Gi"
         }
       }
 
@@ -86,9 +130,30 @@ resource "google_cloud_run_v2_job" "measure" {
           value = "/models"
         }
 
+        # trust_remote_code でカスタムパイプラインを読むとき、diffusers は
+        # コードを HF_HOME/modules に書き出す。HF_HOME はバケットの
+        # 読み取り専用マウントなので書けず、
+        # 「[Errno 30] Read-only file system: '/models/modules'」で
+        # テクスチャ生成モデルのロードが失敗する。
+        #
+        # refs/main への書き込み失敗は Ignored error として無視されるが、
+        # modules は無視されない。ローカル実行では ~/.cache/huggingface が
+        # 書き込み可能なため顕在化しない。
+        env {
+          name  = "HF_MODULES_CACHE"
+          value = "/tmp/hf_modules"
+        }
+
         volume_mounts {
           name       = "weights"
           mount_path = "/models"
+        }
+
+        # gcsfuse のキャッシュ実体。cache-dir から cr-volume: で参照するだけでなく、
+        # in-memory ボリュームはコンテナにマウントする必要がある
+        volume_mounts {
+          name       = "cache"
+          mount_path = "/gcsfuse-cache"
         }
 
         # L4 を使う場合、4vCPU / 16GiB が下限として要求される
