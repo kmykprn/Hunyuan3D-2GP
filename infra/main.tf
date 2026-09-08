@@ -8,6 +8,24 @@
 
 terraform {
   required_version = ">= 1.5"
+
+  # state は GCS に置く。ローカルに置くと、作った本人の端末にしか
+  # 状態が無く、他の人が apply すると既存リソースを認識できずに
+  # 重複作成やエラーになる。
+  #
+  # このバケットだけは Terraform では作れない（自分の state の置き場を
+  # 自分で管理できないため）。手で作ってある:
+  #   gcloud storage buckets create gs://<project-id>-tfstate \
+  #     --location=asia-southeast1 --uniform-bucket-level-access
+  #   gcloud storage buckets update gs://<project-id>-tfstate \
+  #     --versioning --public-access-prevention
+  #
+  # bucket は変数を使えない（初期化時点では変数が解決されない）ので直書きする
+  backend "gcs" {
+    bucket = "project-db31f07b-2895-48b8-8bb-tfstate"
+    prefix = "hunyuan3d"
+  }
+
   required_providers {
     google = {
       source  = "hashicorp/google"
