@@ -16,9 +16,16 @@ terraform {
   }
 }
 
+# billing_project / user_project_override は billingbudgets のように
+# 「プロジェクトに属さない」APIを、ユーザーのADCで叩くために要る。
+# 無いと呼び出しが gcloud の既定クライアントプロジェクトに紐づけられ、
+# そちらでAPIが無効なため SERVICE_DISABLED で失敗する
+# （consumer が自分のプロジェクトではない番号になっているのが目印）。
 provider "google" {
-  project = var.project_id
-  region  = var.region
+  project               = var.project_id
+  region                = var.region
+  billing_project       = var.project_id
+  user_project_override = true
 }
 
 # 使う API を明示的に有効化する。
