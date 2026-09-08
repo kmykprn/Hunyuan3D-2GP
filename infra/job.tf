@@ -100,6 +100,15 @@ resource "google_cloud_run_v2_job" "measure" {
             # 6144 にしたところ、アプリ側と合わせて 16GiB を超えて OOM で
             # 落ちた（テクスチャ側は paint と delight の2本がロードされる）
             "file-cache-max-size-mb=4096",
+            # 範囲読みでもファイル全体をキャッシュに載せる。既定は false で、
+            # その場合レンジリクエストはキャッシュを素通りして低速パスに落ちる。
+            # diffusers は .bin (zip) を範囲読みするため、これが効く可能性が高い。
+            #
+            # なお download-chunk-size-mb と parallel-downloads-per-file を
+            # 同時に引き上げたところ OOM で落ちた。これらのバッファは
+            # file-cache-max-size-mb とは別枠でメモリを食う
+            # (512MB × 32並列 = 最大16GB)ので、既定のままにしておく
+            "file-cache-cache-file-for-range-read=true",
             # 大きなファイルの初回読み込みを並列化する
             "file-cache-enable-parallel-downloads=true",
             # 重みは実行中に変わらないので、メタデータは無期限にキャッシュしてよい
@@ -143,6 +152,7 @@ resource "google_cloud_run_v2_job" "measure" {
           name  = "HF_MODULES_CACHE"
           value = "/tmp/hf_modules"
         }
+
 
         volume_mounts {
           name       = "weights"

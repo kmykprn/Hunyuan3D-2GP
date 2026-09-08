@@ -209,3 +209,105 @@ safetensors の mmap によるページフォルトが1回ずつ GCS へのレ�
 - **生成物バケットがジョブにマウントされていない。** 出力は `/tmp/output` に
   書かれて消える。時間の計測が目的なら実害はないが、生成物を残すなら追加が要る
 - `.bin` 除去による改善（仮説B）は未検証
+
+---
+
+# 第3回 — 高速化の検証（打ち手3・4）
+
+第2回で確定した「モデルロード263秒が毎回発生する」ことに対し、
+2つの打ち手を検証した。
+
+## 打ち手3: gcsfuse のチューニング → 効果なし
+
+`file-cache-cache-file-for-range-read` の既定は false で、`.bin` は zip 形式の
+ため範囲読みされる。キャッシュを素通りして低速パスに落ちている可能性を疑った。
+
+| 区間 | 基準 | 範囲読みキャッシュ有効 |
+|---|---|---|
+| テクスチャモデルのロード | 185秒 | 185秒 |
+| 形状モデルのロード | 78秒 | 76秒 |
+| 全体 | 533秒 | 531秒 |
+
+**差は測定誤差の範囲。** 同条件の実行4回が 516〜533秒（ばらつき3%）に
+収まっているので、この結論は安全に出せる。
+
+### 副産物: バッファはキャッシュ上限とは別枠でメモリを食う
+
+`file-cache-download-chunk-size-mb=512` と
+`file-cache-parallel-downloads-per-file=32` を同時に上げたところ OOM で落ちた。
+これらのバッファは `file-cache-max-size-mb` に含まれず、
+512MB × 32並列 = 最大16GB になる。既定のままにしておくこと。
+
+## 打ち手4: safetensors 化 → 仮説は裏付けたが未実測
+
+### 仮説は正しい
+
+`is_safetensors_compatible` が **False** を返す。
+
+```
+text_encoder/pytorch_model.bin          ← .bin のみ
+unet/diffusion_pytorch_model.bin
+unet/diffusion_pytorch_model.safetensors
+vae/diffusion_pytorch_model.bin
+vae/diffusion_pytorch_model.safetensors
+```
+
+diffusers は「全コンポーネントに safetensors が揃っているか」で形式を決めるため、
+text_encoder に .bin しか無いことが原因で **3.41GB の unet も pickle 版が
+使われている。**
+
+### 検証の実装は2回とも失敗した
+
+| 方法 | 結果 |
+|---|---|
+| バケットから .bin を削除 | HF が Hub と照合して欠けたファイルを再DLしようとし、読み取り専用の blobs/ に書けず失敗 |
+| ＋ HF_HUB_OFFLINE=1 | 展開済みコピーは blobs/ を持たないため、オフラインではリビジョンを解決できず失敗 |
+
+**HF のキャッシュはファイルを間引ける構造ではない。**
+`cp -rL` で展開したコピーはオンラインなら動くが、オフライン解決には使えない。
+
+### 正しい検証方法
+
+`.bin` を消すのではなく、コード側で `use_safetensors=True` を渡す。
+
+```python
+# hy3dgen/texgen/utils/multiview_utils.py
+pipeline = DiffusionPipeline.from_pretrained(
+    multiview_ckpt_path,
+    custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16,
+    trust_remote_code=True,
+    use_safetensors=True)
+```
+
+バケットに手を入れず HF の照合とも衝突しないが、イメージの再ビルドが要る。
+
+### 見込まれる効果
+
+| 経路 | スループット |
+|---|---|
+| 形状モデル（safetensors、hy3dgen が直接読む） | 約95MB/s |
+| テクスチャ（.bin、diffusers 経由） | 約48MB/s |
+
+safetensors 経路が同等の速度になるなら、テクスチャのロードは 185秒 → 約95秒。
+1回あたり 533秒 → 約440秒（$0.142）、月500生成で $86 → $71。
+
+**約17%の改善**にとどまり、打ち手1（サービス化）や打ち手2（テクスチャ廃止）に
+比べると小さい。
+
+## 打ち手の優先度（更新）
+
+| 打ち手 | 効果 | 状態 |
+|---|---|---|
+| 1. サービス化してモデルロードを再利用 | ロード263秒(49%)が消える | 未検討 |
+| 2. テクスチャをやめる | 月$86 → $39 | 未検証 |
+| 4. safetensors 化 | 月$86 → $71（推定） | 仮説確認済み・未実測 |
+| 3. gcsfuse チューニング | なし | **検証済み・空振り** |
+
+## この回の費用
+
+約 $0.37（失敗した実行を含む）。
+
+## バケットの状態
+
+検証のために削除した .bin は復元済み。復旧後の実行が516秒で成功することを
+確認している。
