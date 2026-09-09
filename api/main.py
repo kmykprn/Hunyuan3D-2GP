@@ -19,6 +19,7 @@ import google.auth.transport.requests
 import pillow_heif
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from firebase_admin import auth as fb_auth
+from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.cloud import storage
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -50,6 +51,12 @@ DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
 ALLOWLIST_PATH = "config/allowed_uids.json"
 ALLOWLIST_TTL = datetime.timedelta(seconds=60)
 _allowlist_cache: tuple[datetime.datetime, set] | None = None
+
+# 枠を取った直後は status.json がまだ無い。その隙に別のリクエストが
+# 「もう終わっている」と誤判定して枠を奪えてしまうため、取り立ての枠は
+# 状態を問わず生きているものとして扱う。
+# 逆に、枠を取った直後にインスタンスが死んだ場合はこの時間で解放される
+SLOT_GRACE = datetime.timedelta(seconds=60)
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
@@ -175,7 +182,10 @@ def _signed_model_url(job_id: str) -> str:
     # 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT になる。
     # _credentials は cloud-platform スコープで取得してある
     credentials = _credentials
-    if not getattr(credentials, "service_account_email", None) or not credentials.token:
+    # token の有無ではなく valid を見る。トークンは存在していても期限切れがあり、
+    # 有無だけで判定すると、インスタンスが1時間以上生きたあとで署名が失敗する。
+    # service_account_email は refresh するまで埋まらないことがあるので併せて見る
+    if not credentials.valid or not getattr(credentials, "service_account_email", None):
         credentials.refresh(google.auth.transport.requests.Request())
 
     return _bucket().blob(f"jobs/{job_id}/model.glb").generate_signed_url(
@@ -222,22 +232,121 @@ def _active_blob(uid: str):
     return _bucket().blob(f"quota/{uid}/active.json")
 
 
-def _check_no_active_job(uid: str) -> None:
-    """同じ利用者の並行実行を防ぐ。
+def _job_is_running(job_id: str | None) -> bool:
+    """そのジョブがまだ動いているか。状態が読めないものは動いていない扱い。"""
+    if not job_id:
+        return False
+    blob = _status_blob(job_id)
+    if not blob.exists():
+        return False
+    return json.loads(blob.download_as_text())["state"] in ("queued", "running")
 
-    許すとGPUが同時に立ち上がり、事故的に高くつく。
+
+def _read_slot(blob) -> tuple[dict, int | None]:
+    """枠の中身と generation を返す。
+
+    generation が None なら枠は存在しない。中身が読めないときは空の辞書を返し、
+    握っている者が不明なものとして扱う。
+    """
+    try:
+        blob.reload()
+    except NotFound:
+        return {}, None
+    try:
+        return json.loads(blob.download_as_text()), blob.generation
+    except (ValueError, NotFound):
+        return {}, blob.generation
+
+
+def _slot_is_fresh(claimed_at: str | None) -> bool:
+    """取り立ての枠か。status.json が書かれる前の隙間を守るための判定。"""
+    if not claimed_at:
+        return False
+    try:
+        claimed = datetime.datetime.fromisoformat(claimed_at)
+    except ValueError:
+        return False
+    return datetime.datetime.now(datetime.timezone.utc) - claimed < SLOT_GRACE
+
+
+def _claim_slot(uid: str, job_id: str) -> int:
+    """この利用者の実行枠を確保する。埋まっていれば 409。
+
+    並行実行を許すとGPUが同時に立ち上がり、事故的に高くつく。
+
+    「存在を確かめてから書く」ではなく、**GCS の条件付き書き込みで確保する**。
+    if_generation_match=0 は「まだ無いときだけ作る」で、これが排他ロックになる。
+    確認と書き込みを分けると、その間に通った2件目が同時にGPUを立ち上げる。
+    ジョブの起動には数秒かかるので窓が広く、ボタンの二度押しで踏む。
     """
     blob = _active_blob(uid)
+    payload = json.dumps({"jobId": job_id, "claimedAt": _now()})
+
+    # 取れなかった理由は「まだ動いている」か「終わったのに枠が残っている」の
+    # どちらか。後者なら1度だけ解放して取り直す（無限には繰り返さない）
+    for attempt in (1, 2):
+        try:
+            blob.upload_from_string(
+                payload, content_type="application/json", if_generation_match=0
+            )
+            # 解放するときに「自分が取った枠か」を確かめるために覚えておく
+            return blob.generation
+        except PreconditionFailed:
+            pass
+
+        slot, generation = _read_slot(blob)
+        if generation is None:
+            # 読みに行く間に解放された。空いたので取り直す
+            continue
+
+        holder = slot.get("jobId")
+        # 取り立ての枠は、status.json がまだ無くても生きているものとして扱う
+        if _slot_is_fresh(slot.get("claimedAt")) or (holder and _job_is_running(holder)):
+            raise HTTPException(
+                status_code=409, detail=f"生成中のジョブがある: {holder}"
+            )
+
+        if attempt == 1:
+            # 終わったジョブが枠を握ったままなので解放する。
+            # generation を指定するので、その隙に他が取っていれば空振りする
+            try:
+                blob.delete(if_generation_match=generation)
+            except (PreconditionFailed, NotFound):
+                pass
+
+    raise HTTPException(
+        status_code=409, detail="実行枠を確保できなかった。少し待ってやり直してほしい"
+    )
+
+
+def _release_slot(uid: str, generation: int) -> None:
+    """自分が取った実行枠を解放する。
+
+    generation を指定するのは、既に別のリクエストが取り直した枠を
+    誤って消さないため。解放しきれなくても、次の投稿が終了済みと
+    判断して解放するので詰まりはしない。
+    """
+    try:
+        _active_blob(uid).delete(if_generation_match=generation)
+    except (PreconditionFailed, NotFound):
+        pass
+
+
+def _quota_blob(uid: str):
+    """当日ぶんのカウンタ。日付が変わると別のファイルになり、自然に0から始まる。"""
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    return _bucket().blob(f"quota/{uid}/{today}.json")
+
+
+def _read_count(blob) -> tuple[int, int]:
+    """現在の回数と generation を返す。まだ無ければ (0, 0)。
+
+    generation は条件付き書き込みに渡す。0 は「まだ無いときだけ書く」の意味になる。
+    """
     if not blob.exists():
-        return
-    job_id = json.loads(blob.download_as_text()).get("jobId")
-    st = _status_blob(job_id) if job_id else None
-    if st and st.exists():
-        state = json.loads(st.download_as_text())["state"]
-        if state in ("queued", "running"):
-            raise HTTPException(status_code=409, detail=f"生成中のジョブがある: {job_id}")
-    # 終わっているので解放する
-    blob.delete()
+        return 0, 0
+    blob.reload()
+    return json.loads(blob.download_as_text()).get("count", 0), blob.generation
 
 
 def _consume_quota(uid: str) -> None:
@@ -246,14 +355,8 @@ def _consume_quota(uid: str) -> None:
     generation の指定で競合を検出する。同じ利用者が同時に投げても
     二重に数え落とさない
     """
-    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-    blob = _bucket().blob(f"quota/{uid}/{today}.json")
-    if blob.exists():
-        blob.reload()
-        count = json.loads(blob.download_as_text()).get("count", 0)
-        generation = blob.generation
-    else:
-        count, generation = 0, 0
+    blob = _quota_blob(uid)
+    count, generation = _read_count(blob)
     if count >= DAILY_LIMIT:
         raise HTTPException(
             status_code=429, detail=f"本日の上限（{DAILY_LIMIT}回）に達した"
@@ -264,8 +367,27 @@ def _consume_quota(uid: str) -> None:
             content_type="application/json",
             if_generation_match=generation,
         )
-    except Exception:
+    except PreconditionFailed:
+        # 競合だけをここで扱う。通信障害などを 409 にすると原因を見誤る
         raise HTTPException(status_code=409, detail="同時に処理されたので、やり直してほしい")
+
+
+def _refund_quota(uid: str) -> None:
+    """消費した枠を1つ戻す。ジョブを起動できなかったときだけ呼ぶ。"""
+    blob = _quota_blob(uid)
+    count, generation = _read_count(blob)
+    if count <= 0:
+        return
+    try:
+        blob.upload_from_string(
+            json.dumps({"count": count - 1}),
+            content_type="application/json",
+            if_generation_match=generation,
+        )
+    except PreconditionFailed:
+        # 同時に別のリクエストが数えた。返せなかった1回分は諦める
+        # （多く数えることはあっても、少なく数えることはない側に倒す）
+        pass
 
 
 @app.get("/health")
@@ -321,7 +443,6 @@ async def create_job(
 ):
     uid = _uid_from_token(authorization)
     _check_allowed(uid)
-    _check_no_active_job(uid)
 
     data = await image.read()
     if not data:
@@ -336,38 +457,49 @@ async def create_job(
     # GPU を起動する前にここで確実に弾く
     png = _normalize_image(data)
 
-    # 画像が正当だと分かってから枠を消費する。壊れた画像で枠を失わせない
-    _consume_quota(uid)
-
     job_id = f"job_{uuid.uuid4().hex[:16]}"
 
-    _bucket().blob(f"jobs/{job_id}/input.png").upload_from_string(
-        png, content_type="image/png"
-    )
-
-    now = _now()
-    status = {
-        "jobId": job_id,
-        "uid": uid,
-        "state": "queued",
-        "createdAt": now,
-        "updatedAt": now,
-        "executionName": None,
-        "error": None,
-    }
-    _write_status(job_id, status)
-
+    # 画像が正当だと分かってから枠を取る。壊れた画像で枠を失わせない。
+    # 確保はジョブの起動より先に済ませる。あとに回すと、起動にかかる数秒の間に
+    # 2件目が通ってGPUが2本立つ
+    slot_generation = _claim_slot(uid, job_id)
     try:
-        execution_name = _start_job(job_id)
-    except Exception as e:
-        # 起動できなかったことを状態に残す。残さないと queued のまま放置される
-        _write_status(job_id, {**status, "state": "failed", "error": f"ジョブの起動に失敗: {e}"})
-        raise HTTPException(status_code=502, detail=f"ジョブの起動に失敗: {e}")
+        _consume_quota(uid)
 
-    _write_status(job_id, {**status, "executionName": execution_name})
-    _active_blob(uid).upload_from_string(
-        json.dumps({"jobId": job_id}), content_type="application/json"
-    )
+        _bucket().blob(f"jobs/{job_id}/input.png").upload_from_string(
+            png, content_type="image/png"
+        )
+
+        now = _now()
+        status = {
+            "jobId": job_id,
+            "uid": uid,
+            "state": "queued",
+            "createdAt": now,
+            "updatedAt": now,
+            "executionName": None,
+            "error": None,
+        }
+        _write_status(job_id, status)
+
+        try:
+            execution_name = _start_job(job_id)
+        except Exception as e:
+            # 起動できなかったことを状態に残す。残さないと queued のまま放置される
+            _write_status(
+                job_id, {**status, "state": "failed", "error": f"ジョブの起動に失敗: {e}"}
+            )
+            # 起動していないので枠を返す。生成できていないのに1回分を失わせない
+            _refund_quota(uid)
+            raise HTTPException(status_code=502, detail=f"ジョブの起動に失敗: {e}")
+
+        _write_status(job_id, {**status, "executionName": execution_name})
+    except Exception:
+        # ここまでに失敗したなら、そのジョブは動いていない。
+        # 枠を握ったままにすると、次の投稿まで利用者が締め出される
+        _release_slot(uid, slot_generation)
+        raise
+
     return {"jobId": job_id}
 
 

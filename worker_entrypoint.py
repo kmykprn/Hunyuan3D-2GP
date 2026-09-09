@@ -106,7 +106,7 @@ def main() -> int:
                 raise RuntimeError("メモリ不足で強制終了された")
             # 最後の例外行だけを理由にする。全文は Cloud Logging にある
             print(result.stderr, file=sys.stderr)
-            lines = [l for l in (result.stderr or "").strip().splitlines() if l and not l.startswith(" ")]
+            lines = [ln for ln in (result.stderr or "").strip().splitlines() if ln and not ln.startswith(" ")]
             detail = lines[-1] if lines else "詳細はログを参照"
             raise RuntimeError(f"生成に失敗: {detail}")
 

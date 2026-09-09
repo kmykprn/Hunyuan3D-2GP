@@ -41,6 +41,13 @@ Content-Type: multipart/form-data
 **409 を返すのは意図的。** 同一ユーザーの並行実行を許すとGPUが同時に立ち上がり、
 事故的に高くつく。
 
+**判定は「確かめてから書く」ではなく、GCS の条件付き書き込みで枠を取る。**
+`quota/{uid}/active.json` を `if_generation_match=0`（まだ無いときだけ作る）で
+書き、失敗したら 409。確認と書き込みを分けると、その間に2件目が通ってしまう。
+ジョブの起動には数秒かかるので窓が広く、ボタンの二度押しで踏む。
+
+枠を取るのは**ジョブの起動より先**。起動できなかった場合は枠と回数の両方を戻す。
+
 ### `GET /jobs/{jobId}`
 
 ```
@@ -56,9 +63,14 @@ Authorization: Bearer <Firebase ID トークン>
 
 他人の `jobId` には 404 を返す（存在を隠すため 403 ではなく 404）。
 
-### `GET /healthz`
+### `GET /health`
 
 認証不要。疎通確認用。
+
+**`/healthz` は使えない。** Cloud Run の Google Frontend がこのパスを横取りし、
+アプリに到達する前に HTML の404を返す（アプリ側で登録しても届かない）。
+`Content-Type` を見ると切り分けられる（アプリなら `application/json`、
+横取りされていれば `text/html`）。
 
 ## GCS のレイアウト
 
@@ -69,6 +81,7 @@ jobs/{jobId}/input.png       クライアントが上げた画像
 jobs/{jobId}/status.json     状態
 jobs/{jobId}/model.glb       成果物
 quota/{uid}/{YYYY-MM-DD}.json  当日の実行回数
+quota/{uid}/active.json      実行中のジョブ（並行実行を防ぐ排他ロック）
 config/allowed_uids.json     限定公開中の許可リスト
 ```
 
@@ -109,6 +122,8 @@ config/allowed_uids.json     限定公開中の許可リスト
 | サーバー側でも縮小 | 長辺1024pxを超えていれば縮める |
 | サーバー側の上限 | 5MB |
 | 保存形式 | PNG に正規化して `input.png` に置く |
+| 出力 | GLB 約4.8MB / テクスチャ2048px |
+| 背景除去 | サーバー側（`rembg` が既に入っている） |
 
 **HEIC を受けるのは iPhone が既定でこの形式を使うため。** WebP は Android の
 ブラウザから来ることがある。
@@ -119,8 +134,6 @@ config/allowed_uids.json     限定公開中の許可リスト
 
 生成側は PNG しか受け取らないので、**GPUイメージには HEIC の対応を入れていない。**
 形式の吸収はすべてAPI層で完結させている。
-| 出力 | GLB 約4.8MB / テクスチャ2048px |
-| 背景除去 | サーバー側（`rembg` が既に入っている） |
 
 ## 限定公開から製品版への移行
 
