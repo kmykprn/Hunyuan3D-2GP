@@ -61,6 +61,9 @@ resource "google_project_service" "required" {
     # job.tf がジョブ用のサービスアカウントを作るのに要る。
     # 無いと google_service_account の作成が accessNotConfigured で落ちる
     "iam.googleapis.com",
+    # API層が署名付きURLを発行するのに要る。Cloud Run のサービスアカウントは
+    # 秘密鍵を持たないので、SignBlob API に署名を代行させる
+    "iamcredentials.googleapis.com",
   ])
 
   service            = each.value
