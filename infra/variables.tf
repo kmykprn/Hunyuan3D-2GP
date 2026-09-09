@@ -106,6 +106,18 @@ variable "daily_limit" {
   default     = 10
 }
 
+variable "daily_attempt_limit" {
+  description = <<-EOT
+    1 uid あたり1日に起動できる回数。失敗も数え、戻さない。
+
+    失敗した生成は daily_limit には数えない（利用者がこちら都合の失敗で
+    枠を失わないため）が、それだけだと生成に向かない画像で延々と
+    再試行でき、そのたびに GPU が起動する。1回約39円なので上限を置く。
+  EOT
+  type        = number
+  default     = 20
+}
+
 variable "public_access" {
   description = <<-EOT
     Cloud Run の入口を開けるか。

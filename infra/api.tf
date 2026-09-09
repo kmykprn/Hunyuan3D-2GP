@@ -26,6 +26,14 @@ resource "google_storage_bucket_iam_member" "api_rw_outputs" {
 # generate_signed_url をそのまま呼ぶと署名できずに失敗する。
 # IAM の SignBlob API に署名を代行させる必要があり、そのために
 # 「自分自身に対する」トークン作成権限を付ける
+# 許可リストは**読むだけ**。書き込みは運用者が gcloud で行う。
+# objectAdmin を与えると、門番を門番自身が書き換えられる状態になる
+resource "google_storage_bucket_iam_member" "api_reads_config" {
+  bucket = google_storage_bucket.config.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.api.email}"
+}
+
 resource "google_service_account_iam_member" "api_can_sign_as_itself" {
   service_account_id = google_service_account.api.name
   role               = "roles/iam.serviceAccountTokenCreator"
@@ -85,6 +93,16 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "DAILY_LIMIT"
         value = tostring(var.daily_limit)
+      }
+
+      env {
+        name  = "DAILY_ATTEMPT_LIMIT"
+        value = tostring(var.daily_attempt_limit)
+      }
+
+      env {
+        name  = "CONFIG_BUCKET"
+        value = google_storage_bucket.config.name
       }
 
       env {

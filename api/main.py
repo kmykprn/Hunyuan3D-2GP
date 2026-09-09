@@ -11,6 +11,7 @@ import datetime
 import io
 import json
 import os
+import re
 import uuid
 
 import firebase_admin
@@ -47,8 +48,15 @@ ENFORCE_ALLOWLIST = os.environ.get("ENFORCE_ALLOWLIST", "true").lower() == "true
 
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
 
+# 失敗は回数に数えないが、起動そのものには上限を置く。
+# 無いと、生成に向かない画像で延々と再試行でき、そのたびGPUが起動する
+DAILY_ATTEMPT_LIMIT = int(os.environ.get("DAILY_ATTEMPT_LIMIT", "20"))
+
 # 許可リストは GCS に置く。uid を足すたびに再デプロイしないため。
 # 毎リクエスト読むと待ち時間が延びるので短時間だけ覚えておく
+# 生成物バケットとは別のバケットに置く。API はこちらに読み取り権限しか持たない。
+# 同居させると、門番を門番自身が書き換えられる状態になる
+CONFIG_BUCKET = os.environ["CONFIG_BUCKET"]
 ALLOWLIST_PATH = "config/allowed_uids.json"
 ALLOWLIST_TTL = datetime.timedelta(seconds=60)
 _allowlist_cache: tuple[datetime.datetime, set] | None = None
@@ -158,6 +166,17 @@ def _bucket():
     return _storage.bucket(OUTPUTS_BUCKET)
 
 
+# 採番は job_ + uuid4 の16桁。GCS のオブジェクト名は不透明な文字列で
+# ".." を解決しないため実際にパス操作は成立しないが、その性質に依存せず入口で弾く
+JOB_ID_PATTERN = re.compile(r"^job_[0-9a-f]{16}$")
+
+
+def _validate_job_id(job_id: str) -> None:
+    if not JOB_ID_PATTERN.match(job_id):
+        # 存在しないものと同じ扱いにする。形式の違いを教えない
+        raise HTTPException(status_code=404, detail="そのジョブは存在しない")
+
+
 def _status_blob(job_id: str):
     return _bucket().blob(f"jobs/{job_id}/status.json")
 
@@ -242,7 +261,7 @@ def _allowed_uids() -> set:
     now = datetime.datetime.now(datetime.timezone.utc)
     if _allowlist_cache and now - _allowlist_cache[0] < ALLOWLIST_TTL:
         return _allowlist_cache[1]
-    blob = _bucket().blob(ALLOWLIST_PATH)
+    blob = _storage.bucket(CONFIG_BUCKET).blob(ALLOWLIST_PATH)
     uids = set(json.loads(blob.download_as_text())) if blob.exists() else set()
     _allowlist_cache = (now, uids)
     return uids
@@ -363,32 +382,56 @@ def _quota_blob(uid: str):
     return _bucket().blob(f"quota/{uid}/{today}.json")
 
 
-def _read_count(blob) -> tuple[int, int]:
-    """現在の回数と generation を返す。まだ無ければ (0, 0)。
+def _read_quota(blob) -> tuple[dict, int]:
+    """当日のカウンタの中身と generation を返す。まだ無ければ ({}, 0)。
 
     generation は条件付き書き込みに渡す。0 は「まだ無いときだけ書く」の意味になる。
     """
     if not blob.exists():
-        return 0, 0
+        return {}, 0
     blob.reload()
-    return json.loads(blob.download_as_text()).get("count", 0), blob.generation
+    try:
+        return json.loads(blob.download_as_text()), blob.generation
+    except ValueError:
+        # 壊れていたら数え直す。多く数える側に倒れるので安全側
+        return {}, blob.generation
 
 
 def _consume_quota(uid: str) -> None:
-    """当日の実行回数を1増やす。上限に達していれば 429。
+    """当日の回数を1増やす。上限に達していれば 429。
+
+    2つ数える。
+
+      count    … 成功として数える回数。**失敗した生成はここから戻す**ので、
+                 利用者はこちら都合の失敗で枠を失わない
+      attempts … 起動した回数。**戻さない**
+
+    attempts が要るのは、失敗が必ず戻るだけだと、生成に向かない画像で
+    延々と再試行できてしまい、そのたびに GPU が起動するため。
+    1回あたり約39円かかるので、失敗の繰り返しにも上限を置く。
 
     generation の指定で競合を検出する。同じ利用者が同時に投げても
-    二重に数え落とさない
+    二重に数え落とさない。
     """
     blob = _quota_blob(uid)
-    count, generation = _read_count(blob)
+    data, generation = _read_quota(blob)
+    count = data.get("count", 0)
+    attempts = data.get("attempts", 0)
+
     if count >= DAILY_LIMIT:
         raise HTTPException(
             status_code=429, detail=f"本日の上限（{DAILY_LIMIT}回）に達した"
         )
+    if attempts >= DAILY_ATTEMPT_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"本日の試行回数の上限（{DAILY_ATTEMPT_LIMIT}回）に達した。"
+                   f"失敗が続いている場合は、別の画像で試してほしい",
+        )
+
     try:
         blob.upload_from_string(
-            json.dumps({"count": count + 1}),
+            json.dumps({"count": count + 1, "attempts": attempts + 1}),
             content_type="application/json",
             if_generation_match=generation,
         )
@@ -397,22 +440,40 @@ def _consume_quota(uid: str) -> None:
         raise HTTPException(status_code=409, detail="同時に処理されたので、やり直してほしい")
 
 
-def _refund_quota(uid: str) -> None:
-    """消費した枠を1つ戻す。ジョブを起動できなかったときだけ呼ぶ。"""
+def _restore_quota(uid: str) -> None:
+    """失敗した生成を回数に数えない。
+
+    count だけ戻し、attempts は戻さない（上の説明を参照）。
+    """
     blob = _quota_blob(uid)
-    count, generation = _read_count(blob)
+    data, generation = _read_quota(blob)
+    count = data.get("count", 0)
     if count <= 0:
         return
     try:
         blob.upload_from_string(
-            json.dumps({"count": count - 1}),
+            json.dumps({**data, "count": count - 1}),
             content_type="application/json",
             if_generation_match=generation,
         )
     except PreconditionFailed:
-        # 同時に別のリクエストが数えた。返せなかった1回分は諦める
+        # 同時に別のリクエストが数えた。戻せなかった1回分は諦める
         # （多く数えることはあっても、少なく数えることはない側に倒す）
         pass
+
+
+def _restore_quota_if_failed(status: dict) -> dict:
+    """失敗が確定したジョブの回数を戻す。
+
+    失敗が分かるのは状態を見にきたときなので、ここで戻す。
+    二重に戻さないよう、戻したことを状態に記録する。
+    """
+    if status["state"] != "failed" or status.get("quotaRestored"):
+        return status
+    _restore_quota(status["uid"])
+    status["quotaRestored"] = True
+    _write_status(status["jobId"], status)
+    return status
 
 
 @app.get("/health")
@@ -515,7 +576,7 @@ async def create_job(
                 job_id, {**status, "state": "failed", "error": f"ジョブの起動に失敗: {e}"}
             )
             # 起動していないので枠を返す。生成できていないのに1回分を失わせない
-            _refund_quota(uid)
+            _restore_quota(uid)
             raise HTTPException(status_code=502, detail=f"ジョブの起動に失敗: {e}")
 
         _write_status(job_id, {**status, "executionName": execution_name})
@@ -531,6 +592,7 @@ async def create_job(
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, authorization: str | None = Header(default=None)):
     uid = _uid_from_token(authorization)
+    _validate_job_id(job_id)
     blob = _status_blob(job_id)
     if not blob.exists():
         raise HTTPException(status_code=404, detail="そのジョブは存在しない")
@@ -542,6 +604,7 @@ def get_job(job_id: str, authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=404, detail="そのジョブは存在しない")
 
     status = _reconcile_if_stale(status)
+    status = _restore_quota_if_failed(status)
 
     body = {
         "state": status["state"],
