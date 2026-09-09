@@ -112,6 +112,15 @@ gcloud storage cp /tmp/a.json $B
 
 ---
 
+# セキュリティ
+
+**`../api/SECURITY.md` を参照。** 何が門番で、何が守っていないかと、
+Firebase 側（Terraform 管理外）で確認すべき項目がまとまっている。
+
+**ブラウザから叩けるオリジンは本番だけ。** `localhost` は既定に入れていない。
+開発でローカルから実APIを叩く必要が出たときだけ `terraform.tfvars` に足し、
+用が済んだら戻す。
+
 # 誰が叩けるのか（重要）
 
 **Cloud Run の入口は `allUsers` に開いている。** ブラウザのSPAからは
