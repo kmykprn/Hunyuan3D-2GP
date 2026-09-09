@@ -14,3 +14,8 @@ output "run_job_command" {
     "gcloud run jobs execute ${google_cloud_run_v2_job.measure[0].name} --region ${var.region} --wait"
   ) : "イメージを push し、image 変数を指定して apply し直すとジョブが作られる"
 }
+
+output "allowlist_path" {
+  description = "許可リストの置き場。uid を足すときはここを書き換える（再デプロイ不要）"
+  value       = "gs://${google_storage_bucket.config.name}/config/allowed_uids.json"
+}

@@ -36,7 +36,7 @@ Content-Type: multipart/form-data
 | 401 | トークンが無効 |
 | 403 | 許可リストに無い uid（限定公開中のみ） |
 | 409 | このユーザーに実行中のジョブがある |
-| 429 | 本日の上限（10回）に達した |
+| 429 | 本日の上限（10回）、または起動回数の上限（20回）に達した |
 
 **409 を返すのは意図的。** 同一ユーザーの並行実行を許すとGPUが同時に立ち上がり、
 事故的に高くつく。
@@ -72,6 +72,55 @@ Authorization: Bearer <Firebase ID トークン>
 `Content-Type` を見ると切り分けられる（アプリなら `application/json`、
 横取りされていれば `text/html`）。
 
+## ブラウザから叩くための CORS
+
+アプリ（GitHub Pages）とAPI（Cloud Run）は**別オリジン**なので、
+CORS が無いとブラウザはリクエストを1本も通さない。`curl` では
+起きないため、実装当初は抜けていた。
+
+**2箇所に要る。片方だけでは動かない。**
+
+| | 何のため |
+|---|---|
+| API層（`hunyuan3d-api`） | `POST /jobs` と `GET /jobs/{id}` |
+| **生成物バケット** | **署名付きURLで GLB を取るのはブラウザ**。`storage.googleapis.com` は API層とは別オリジンで、three.js の `GLTFLoader` も内部で `fetch` を使うので同じ制約を受ける |
+
+許可するオリジンは `infra/variables.tf` の `allowed_origins` に列挙する。
+ワイルドカードにはしない。
+
+```
+https://kmykprn.github.io   GitHub Pages
+http://localhost:5173       ローカル開発（vite dev）
+capacitor://localhost       将来 iOS アプリにするとき
+```
+
+`Authorization` ヘッダ付きの multipart なので、ブラウザは本番リクエストの前に
+**preflight（OPTIONS）** を投げる。許可ヘッダに `Authorization` と
+`Content-Type` が要る。
+
+**`allow_credentials` は false のまま。** 認証は Cookie ではなく Bearer トークンで
+行っており、これは別オリジンのページからは付けられない（他人の `localStorage` を
+読めないため）。true にするとワイルドカードが使えなくなるうえ、Cookie を送る
+意図だと誤読される。
+
+## 回数の数え方 ── 失敗は数えない
+
+**こちら都合の失敗で利用者の枠を失わせない。** 2つ数える。
+
+| | 意味 | 失敗したとき |
+|---|---|---|
+| `count` | 成功として数える回数（上限10） | **戻す** |
+| `attempts` | 起動した回数（上限20） | **戻さない** |
+
+`attempts` が要るのは、失敗が必ず戻るだけだと**生成に向かない画像で延々と
+再試行でき、そのたびに GPU が起動する**ため。1回あたり約39円かかる。
+
+戻すのは、状態を見にきたとき（`GET /jobs/{jobId}`）に失敗が確定した時点。
+二重に戻さないよう `status.json` に `quotaRestored` を記録する。
+
+**商用化するときもこの構造のまま使える。** `count` を「クレジット残高」に
+読み替えればよく、判定の位置も変わらない。
+
 ## GCS のレイアウト
 
 生成物バケット（`...-hunyuan3d-outputs`）を状態の置き場としても使う。
@@ -80,10 +129,19 @@ Authorization: Bearer <Firebase ID トークン>
 jobs/{jobId}/input.png       クライアントが上げた画像
 jobs/{jobId}/status.json     状態
 jobs/{jobId}/model.glb       成果物
-quota/{uid}/{YYYY-MM-DD}.json  当日の実行回数
+quota/{uid}/{YYYY-MM-DD}.json  当日の回数（count と attempts）
 quota/{uid}/active.json      実行中のジョブ（並行実行を防ぐ排他ロック）
+```
+
+**許可リストは別のバケット**（`...-hunyuan3d-config`）に置く。
+
+```
 config/allowed_uids.json     限定公開中の許可リスト
 ```
+
+同居させない理由は、API のサービスアカウントが生成物バケットに
+`objectAdmin` を持つため。**門番を門番自身が書き換えられる状態を作らない。**
+API はこのバケットに読み取り権限しか持たず、書き込みは運用者が行う。
 
 `status.json`:
 
@@ -150,6 +208,43 @@ config/allowed_uids.json     限定公開中の許可リスト
 コードの作り直しは発生しない。
 
 `allowed_uids.json` を GCS に置くのは、uid を足すたびに再デプロイしないため。
+
+## 受け入れ確認の観点
+
+変更を入れたら、少なくとも以下を実機で確認する。
+
+### 認可
+
+- [ ] トークン無し → **401**
+- [ ] 不正なトークン → **401**
+- [ ] 許可リストに無い uid → **403**
+- [ ] 他人の `jobId` を引く → **404**（403 ではない。存在を隠す）
+- [ ] 許可リストが空／読めない → **全員 403**（fail-closed であること）
+
+### 回数
+
+- [ ] **生成が失敗したとき、回数（`count`）が減っていないこと** ← 最重要
+  - `status.json` が `failed` になったあと `GET /jobs/{id}` を叩き、
+    `quota/{uid}/{日付}.json` の `count` が消費前に戻っていること
+  - 同じ応答を2回取っても二重に戻らないこと（`quotaRestored`）
+- [ ] 成功したときは `count` が減らずに残ること
+- [ ] 失敗を繰り返すと `attempts` の上限で **429** になること
+- [ ] 409（実行中）と 400（画像が不正）は回数を消費しないこと
+
+### 並行実行
+
+- [ ] 同時に複数投げて、**GPU が1本しか起動しないこと**
+- [ ] 完了後は次を投げられること（枠が解放されている）
+
+### ブラウザから
+
+- [ ] preflight（OPTIONS）が 200 で、許可オリジンが返ること
+- [ ] 許可外のオリジンには CORS ヘッダが付かないこと
+- [ ] **署名付きURLから GLB をブラウザで取得できること**（バケット側の CORS）
+
+### 生成物
+
+- [ ] `textured_mesh` 相当であること（`white_mesh` ではない）
 
 ## この仕様に含めていないもの
 

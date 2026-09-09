@@ -82,10 +82,40 @@ variable "enforce_allowlist" {
   default     = true
 }
 
+variable "allowed_origins" {
+  description = <<-EOT
+    ブラウザから叩くことを許すオリジン。
+
+    アプリは GitHub Pages、APIは Cloud Run と別オリジンなので、
+    ここに載っていないとブラウザはリクエストを通さない。
+    API層のCORSと、生成物バケット（署名付きURLでGLBを取る先）の
+    両方に同じ値を使う。
+
+    Capacitor で iOS アプリにするときは capacitor://localhost を足す。
+  EOT
+  type        = list(string)
+  default = [
+    "https://kmykprn.github.io",
+    "http://localhost:5173",
+  ]
+}
+
 variable "daily_limit" {
   description = "1 uid あたりの1日の生成回数。1回あたり約39円かかる"
   type        = number
   default     = 10
+}
+
+variable "daily_attempt_limit" {
+  description = <<-EOT
+    1 uid あたり1日に起動できる回数。失敗も数え、戻さない。
+
+    失敗した生成は daily_limit には数えない（利用者がこちら都合の失敗で
+    枠を失わないため）が、それだけだと生成に向かない画像で延々と
+    再試行でき、そのたびに GPU が起動する。1回約39円なので上限を置く。
+  EOT
+  type        = number
+  default     = 20
 }
 
 variable "public_access" {
