@@ -72,6 +72,37 @@ Authorization: Bearer <Firebase ID トークン>
 `Content-Type` を見ると切り分けられる（アプリなら `application/json`、
 横取りされていれば `text/html`）。
 
+## ブラウザから叩くための CORS
+
+アプリ（GitHub Pages）とAPI（Cloud Run）は**別オリジン**なので、
+CORS が無いとブラウザはリクエストを1本も通さない。`curl` では
+起きないため、実装当初は抜けていた。
+
+**2箇所に要る。片方だけでは動かない。**
+
+| | 何のため |
+|---|---|
+| API層（`hunyuan3d-api`） | `POST /jobs` と `GET /jobs/{id}` |
+| **生成物バケット** | **署名付きURLで GLB を取るのはブラウザ**。`storage.googleapis.com` は API層とは別オリジンで、three.js の `GLTFLoader` も内部で `fetch` を使うので同じ制約を受ける |
+
+許可するオリジンは `infra/variables.tf` の `allowed_origins` に列挙する。
+ワイルドカードにはしない。
+
+```
+https://kmykprn.github.io   GitHub Pages
+http://localhost:5173       ローカル開発（vite dev）
+capacitor://localhost       将来 iOS アプリにするとき
+```
+
+`Authorization` ヘッダ付きの multipart なので、ブラウザは本番リクエストの前に
+**preflight（OPTIONS）** を投げる。許可ヘッダに `Authorization` と
+`Content-Type` が要る。
+
+**`allow_credentials` は false のまま。** 認証は Cookie ではなく Bearer トークンで
+行っており、これは別オリジンのページからは付けられない（他人の `localStorage` を
+読めないため）。true にするとワイルドカードが使えなくなるうえ、Cookie を送る
+意図だと誤読される。
+
 ## GCS のレイアウト
 
 生成物バケット（`...-hunyuan3d-outputs`）を状態の置き場としても使う。

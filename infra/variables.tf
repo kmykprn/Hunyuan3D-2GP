@@ -82,6 +82,24 @@ variable "enforce_allowlist" {
   default     = true
 }
 
+variable "allowed_origins" {
+  description = <<-EOT
+    ブラウザから叩くことを許すオリジン。
+
+    アプリは GitHub Pages、APIは Cloud Run と別オリジンなので、
+    ここに載っていないとブラウザはリクエストを通さない。
+    API層のCORSと、生成物バケット（署名付きURLでGLBを取る先）の
+    両方に同じ値を使う。
+
+    Capacitor で iOS アプリにするときは capacitor://localhost を足す。
+  EOT
+  type        = list(string)
+  default = [
+    "https://kmykprn.github.io",
+    "http://localhost:5173",
+  ]
+}
+
 variable "daily_limit" {
   description = "1 uid あたりの1日の生成回数。1回あたり約39円かかる"
   type        = number

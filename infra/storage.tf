@@ -24,6 +24,17 @@ resource "google_storage_bucket" "outputs" {
 
   uniform_bucket_level_access = true
 
+  # 署名付きURLで GLB を取るのはブラウザなので、ここにも CORS が要る。
+  # API層とは別のオリジン（storage.googleapis.com）になるため、
+  # API層に CORS を入れただけでは GLB のダウンロードで落ちる。
+  # three.js の GLTFLoader も内部で fetch を使うので同じ制約を受ける
+  cors {
+    origin          = var.allowed_origins
+    method          = ["GET", "HEAD"]
+    response_header = ["Content-Type", "Content-Length"]
+    max_age_seconds = 3600
+  }
+
   # 生成物は再生成できるうえ溜まる一方なので、30日で自動的に消す。
   # 消し忘れによる保管費の積み上がりを防ぐ
   lifecycle_rule {

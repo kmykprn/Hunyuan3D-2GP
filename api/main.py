@@ -18,6 +18,7 @@ import google.auth
 import google.auth.transport.requests
 import pillow_heif
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.cloud import storage
@@ -58,6 +59,14 @@ _allowlist_cache: tuple[datetime.datetime, set] | None = None
 # 逆に、枠を取った直後にインスタンスが死んだ場合はこの時間で解放される
 SLOT_GRACE = datetime.timedelta(seconds=60)
 
+# ブラウザから叩けるようにする（curl では要らないので、実装当初は抜けていた）。
+# アプリは GitHub Pages、APIは Cloud Run と**別オリジン**なので、
+# ここが無いとブラウザはリクエストを1本も通さない。
+# しかも Authorization ヘッダ付きの multipart なので preflight(OPTIONS) が飛ぶ
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 # Content-Type ではなく、実際にデコードできた形式で判定する。
@@ -73,6 +82,22 @@ MAX_EDGE = 1024
 SIGNED_URL_TTL = datetime.timedelta(hours=1)
 
 app = FastAPI()
+
+# 許可するオリジンは列挙する。ワイルドカードにしない。
+#
+# allow_credentials は False のまま。認証は Cookie ではなく Authorization
+# ヘッダの Bearer トークンで行っており、これは別オリジンのページからは
+# 付けられない（他人の localStorage を読めないため）。True にすると
+# ワイルドカードが使えなくなるうえ、Cookie を送る意図だと誤読される
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=False,
+    max_age=3600,
+)
+
 _storage = storage.Client()
 
 # ADC で初期化する。Cloud Run 上ではサービスアカウントの権限がそのまま使われる

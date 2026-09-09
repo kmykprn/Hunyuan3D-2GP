@@ -87,6 +87,11 @@ resource "google_cloud_run_v2_service" "api" {
         value = tostring(var.daily_limit)
       }
 
+      env {
+        name  = "ALLOWED_ORIGINS"
+        value = join(",", var.allowed_origins)
+      }
+
       resources {
         limits = {
           cpu    = "1"
