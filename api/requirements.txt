@@ -3,6 +3,9 @@ uvicorn[standard]
 google-cloud-storage
 google-auth
 python-multipart
+pillow
+# iPhone が既定で送る HEIC/HEIF を Pillow で開けるようにする
+pillow-heif
 
 # firebase-admin は段階3で足す。段階1・2は Cloud Run の IAM で閉じており、
 # アプリケーション側の認証コードを書かない

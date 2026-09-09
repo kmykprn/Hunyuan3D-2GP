@@ -8,14 +8,21 @@
 # ポーリングだけなので Firestore は要らない（SPEC.md 参照）。
 
 import datetime
+import io
 import json
 import os
 import uuid
 
 import google.auth
 import google.auth.transport.requests
+import pillow_heif
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from google.cloud import storage
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+# iPhone が既定で送る HEIC/HEIF を Pillow で開けるようにする。
+# import しただけでは有効にならず、この登録が要る
+pillow_heif.register_heif_opener()
 
 # --- 設定 ---------------------------------------------------------------
 
@@ -33,7 +40,15 @@ STALE_AFTER = datetime.timedelta(minutes=15)
 STAGE1_FIXED_UID = "local-test"
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-ALLOWED_CONTENT_TYPES = {"image/png", "image/jpeg"}
+
+# Content-Type ではなく、実際にデコードできた形式で判定する。
+# 拡張子や Content-Type は詐称できるうえ、実際に「PNG を名乗る壊れたファイル」が
+# 検証をすり抜けて GPU を起動させ、10分後に失敗した実績がある（約39円の無駄）
+ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP", "HEIF", "HEIC", "MPO"}
+
+# 生成パイプラインは長辺1024pxを前提にしている。クライアント側でも縮小するが、
+# 携帯から直接上げられた場合に備えてサーバー側でも縮める
+MAX_EDGE = 1024
 
 # 署名付きURLの有効期限。長くするほど漏れたときの影響が伸びる
 SIGNED_URL_TTL = datetime.timedelta(hours=1)
@@ -166,28 +181,68 @@ def health():
     return {"ok": True}
 
 
-@app.post("/jobs", status_code=202)
-async def create_job(image: UploadFile = File(...)):
-    if image.content_type not in ALLOWED_CONTENT_TYPES:
+def _normalize_image(data: bytes) -> bytes:
+    """受け取った画像を検証し、PNG に正規化して返す。
+
+    ここで弾けなかった画像は GPU を10分間動かしたうえで失敗するので、
+    受け付けの時点で確実に判定する。
+
+    あわせて以下を吸収する。
+      - iPhone の HEIC、Android の WebP
+      - 写真の EXIF 回転（無視すると横倒しのまま生成される）
+      - 携帯から直接上げられた大きすぎる画像
+    """
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except UnidentifiedImageError:
+        raise HTTPException(
+            status_code=400, detail="画像として読み取れない。ファイルが壊れている可能性がある"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"画像の読み取りに失敗: {e}")
+
+    if img.format not in ALLOWED_FORMATS:
         raise HTTPException(
             status_code=400,
-            detail=f"画像は PNG か JPEG のみ。受け取ったのは {image.content_type}",
+            detail=f"対応していない形式: {img.format}。JPEG / PNG / WebP / HEIC が使える",
         )
 
+    # 写真は EXIF に回転情報を持つ。これを反映しないと横倒しで生成される
+    img = ImageOps.exif_transpose(img)
+
+    # 透過を持つ画像はそのまま活かす（背景除去済みの素材が来ることがある）。
+    # 持たないものは RGB に寄せる
+    img = img.convert("RGBA" if img.mode in ("RGBA", "LA", "P") else "RGB")
+
+    if max(img.size) > MAX_EDGE:
+        img.thumbnail((MAX_EDGE, MAX_EDGE), Image.LANCZOS)
+
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+@app.post("/jobs", status_code=202)
+async def create_job(image: UploadFile = File(...)):
     data = await image.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="画像が空")
     if len(data) > MAX_IMAGE_BYTES:
         raise HTTPException(
             status_code=400,
-            detail=f"画像は {MAX_IMAGE_BYTES // (1024 * 1024)}MB まで。受け取ったのは {len(data)} バイト",
+            detail=f"画像は {MAX_IMAGE_BYTES // (1024 * 1024)}MB まで。"
+                   f"受け取ったのは {len(data) / (1024 * 1024):.1f}MB",
         )
-    if not data:
-        raise HTTPException(status_code=400, detail="画像が空")
+
+    # GPU を起動する前にここで確実に弾く
+    png = _normalize_image(data)
 
     job_id = f"job_{uuid.uuid4().hex[:16]}"
     uid = STAGE1_FIXED_UID
 
     _bucket().blob(f"jobs/{job_id}/input.png").upload_from_string(
-        data, content_type=image.content_type
+        png, content_type="image/png"
     )
 
     now = _now()

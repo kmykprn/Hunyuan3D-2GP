@@ -94,16 +94,21 @@ def main() -> int:
                 "--profile", "3",
             ],
             cwd=REPO_DIR,
-            # 出力は捕まえずに素通しする。捕まえると親が全部メモリに溜め、
-            # ただでさえ余裕の無いメモリを圧迫する。
-            # ログは素通しでも Cloud Logging に残る
+            # 標準出力は素通しする。捕まえると親が全部メモリに溜め、
+            # ただでさえ余裕の無いメモリを圧迫する（実測でOOMの一因になった）。
+            # 標準エラーだけは失敗理由に使うので捕まえる。こちらは量が少ない
+            stderr=subprocess.PIPE,
+            text=True,
         )
         if result.returncode != 0:
-            # 詳細は Cloud Logging 側にある。-9 は OOM による SIGKILL
-            reason = "OOM で強制終了された可能性が高い" if result.returncode == -9 else "詳細はログを参照"
-            raise RuntimeError(
-                f"生成が終了コード {result.returncode} で失敗（{reason}）"
-            )
+            if result.returncode == -9:
+                # OOM による SIGKILL。この落ち方では stderr も残らない
+                raise RuntimeError("メモリ不足で強制終了された")
+            # 最後の例外行だけを理由にする。全文は Cloud Logging にある
+            print(result.stderr, file=sys.stderr)
+            lines = [l for l in (result.stderr or "").strip().splitlines() if l and not l.startswith(" ")]
+            detail = lines[-1] if lines else "詳細はログを参照"
+            raise RuntimeError(f"生成に失敗: {detail}")
 
         produced = glob.glob(CACHE_GLOB)
         if not produced:
