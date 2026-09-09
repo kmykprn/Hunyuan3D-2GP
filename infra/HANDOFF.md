@@ -88,7 +88,7 @@ curl -s -X POST -d "grant_type=refresh_token&refresh_token=$RT" \
 | 401 | トークンが無い、または無効 |
 | 403 | 許可リストに載っていない |
 | 409 | **同じ利用者のジョブが実行中**（同時に2本のGPUを立てない） |
-| 429 | 当日の上限（10回）に達した |
+| 429 | 当日の上限に達した（成功10回、または起動20回） |
 | 400 | 画像として読めない、または5MB超 |
 
 409 と 400 は回数を消費しない。
@@ -98,13 +98,17 @@ curl -s -X POST -d "grant_type=refresh_token&refresh_token=$RT" \
 GCS のファイルを1つ書き換えるだけ。**再デプロイは要らない**（60秒で反映）。
 
 ```bash
-B=gs://project-db31f07b-2895-48b8-8bb-hunyuan3d-outputs/config/allowed_uids.json
+B=gs://project-db31f07b-2895-48b8-8bb-hunyuan3d-config/config/allowed_uids.json
 gcloud storage cat $B > /tmp/a.json
 # ["既存のuid", "追加するuid"] の形にする
 gcloud storage cp /tmp/a.json $B
 ```
 
 書き込みには GCS への権限が要る。
+
+**生成物バケットとは別のバケットに置いてある。** APIと生成ジョブは生成物
+バケットに書き込み権限を持つため、同居させると門番を門番自身が
+書き換えられる状態になる。APIはこのバケットを読むだけ。
 
 ---
 
@@ -210,7 +214,8 @@ terraform apply \
 | Cloud Run ジョブ `hunyuan3d-measure` | 生成本体。**常駐しない**。APIから起動される |
 | Artifact Registry `hunyuan3d` | `hunyuan3d:v3`（9.6GB）と `api:v7`（207MB） |
 | 重みバケット | 21.1GB |
-| 生成物バケット | 入力画像・状態・成果物・許可リスト・回数 |
+| 生成物バケット | 入力画像・状態・成果物・回数。30日で自動削除 |
+| 設定バケット | 許可リスト。**APIは読むだけ**。versioning 有効 |
 | state バケット | Terraform の state |
 | 予算アラート | **JPY 5,000円**（50% / 90% / 100% / 予測100%で通知） |
 
