@@ -87,3 +87,18 @@ variable "daily_limit" {
   type        = number
   default     = 10
 }
+
+variable "public_access" {
+  description = <<-EOT
+    Cloud Run の入口を開けるか。
+
+    ブラウザのSPAからは Cloud Run IAM を使えない（IDトークンの audience が
+    合わない）ため、アプリ連携には true が要る。
+
+    開ける前に、Firebase のトークン検証がデプロイ済みで、かつ
+    config/allowed_uids.json による制限が効いていることを必ず確認すること。
+    許可リストが空なら誰も GPU を起動できないので、その状態で開けるのが安全。
+  EOT
+  type        = bool
+  default     = false
+}

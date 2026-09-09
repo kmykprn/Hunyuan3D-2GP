@@ -107,13 +107,23 @@ resource "google_cloud_run_v2_service" "api" {
 # ブラウザのSPAからは Cloud Run IAM は使えない（IDトークンの audience が
 # 合わない）ので、アプリ連携時はここを allUsers にし、
 # アプリケーション側の Firebase 認証で守る形になる
+# ブラウザからは Cloud Run IAM を使えないため入口は開ける。
+#
+# 開けても、アプリケーション側で二重に守っている。
+#   1. Firebase の ID トークンが無い・不正なら 401
+#   2. config/allowed_uids.json に載っていない uid は 403
+#
+# 2 が効いているので、トークン検証に穴があっても GPU は起動できない。
+# 許可リストは GCS に置いてあり、uid を足すたびの再デプロイは要らない。
+#
+# 閉じたいときは var.public_access を false にすれば運用者だけに戻る
 resource "google_cloud_run_v2_service_iam_member" "api_invoker" {
   count = var.api_image == "" ? 0 : 1
 
   name     = google_cloud_run_v2_service.api[0].name
   location = var.region
   role     = "roles/run.invoker"
-  member   = "user:${var.operator_email}"
+  member   = var.public_access ? "allUsers" : "user:${var.operator_email}"
 }
 
 # ジョブを起動するのに要る。
