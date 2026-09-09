@@ -48,3 +48,30 @@ variable "operator_email" {
   description = "API を叩く運用者のGoogleアカウント。段階3で allUsers を許可するまで、この人だけが呼べる"
   type        = string
 }
+
+variable "gpu_type" {
+  description = <<-EOT
+    使う GPU。Cloud Run は nvidia-l4 と nvidia-rtx-pro-6000 の2種類しか提供していない。
+
+    nvidia-rtx-pro-6000 は現状のイメージでは動かない。Blackwell(sm_120)だが
+    torch 2.5.1+cu124 は sm_90 までしか対応せず、
+    「CUDA error: no kernel image is available for execution on the device」で落ちる。
+    使うには torch を cu128 以降に上げ、TORCH_CUDA_ARCH_LIST に 12.0 を足して
+    CUDA拡張を再ビルドする必要がある。
+    しかも単価が L4(8CPU/32GiB)の2.24倍なので、224秒を切らないと費用は増える。
+  EOT
+  type        = string
+  default     = "nvidia-l4"
+}
+
+variable "job_cpu" {
+  description = "生成ジョブのCPU数。L4 は4以上、RTX Pro 6000 は20以上が必須。CPUとメモリには比率の制約があり、32Gi には8CPUが要る（4CPUだと上限16Gi）"
+  type        = string
+  default     = "8"
+}
+
+variable "job_memory" {
+  description = "生成ジョブのメモリ。16Gi では2本目のパイプラインのロード中に OOM する（実測）"
+  type        = string
+  default     = "32Gi"
+}

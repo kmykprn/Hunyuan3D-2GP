@@ -59,7 +59,7 @@ resource "google_cloud_run_v2_job" "measure" {
       gpu_zonal_redundancy_disabled = true
 
       node_selector {
-        accelerator = "nvidia-l4"
+        accelerator = var.gpu_type
       }
 
       # 重みをバケットから読む。gcsfuse でマウントするので、
@@ -176,11 +176,14 @@ resource "google_cloud_run_v2_job" "measure" {
           mount_path = "/gcsfuse-cache"
         }
 
-        # L4 を使う場合、4vCPU / 16GiB が下限として要求される
+        # GPU ごとに下限が決まっている。
+        #   nvidia-l4            : 4 CPU / 16GiB 以上
+        #   nvidia-rtx-pro-6000  : 20 CPU / 80GiB 以上
+        # 下限を割ると deploy 時に弾かれる
         resources {
           limits = {
-            cpu              = "4"
-            memory           = "16Gi"
+            cpu              = var.job_cpu
+            memory           = var.job_memory
             "nvidia.com/gpu" = "1"
           }
         }
