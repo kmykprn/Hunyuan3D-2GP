@@ -74,6 +74,19 @@ resource "google_cloud_run_v2_service" "api" {
         value = "hunyuan3d-measure"
       }
 
+      # 限定公開のあいだは許可リストに載っている uid だけを通す。
+      # 製品版では false にする。変わるのはこの値と、下の invoker の
+      # 付与先（user → allUsers）だけで、コードの作り直しは発生しない
+      env {
+        name  = "ENFORCE_ALLOWLIST"
+        value = tostring(var.enforce_allowlist)
+      }
+
+      env {
+        name  = "DAILY_LIMIT"
+        value = tostring(var.daily_limit)
+      }
+
       resources {
         limits = {
           cpu    = "1"
@@ -88,8 +101,12 @@ resource "google_cloud_run_v2_service" "api" {
 
 # 呼び出し権限は自分のアカウントにだけ付ける。
 #
-# allUsers に付けるのは段階3-2（Firebase のトークン検証）が動いてから。
-# 先に開けると、認証が効いていない状態で誰でもGPUを起動できてしまう
+# allUsers に付けるのは Firebase のトークン検証が動作確認できてから。
+# 先に開けると、認証が効いていない状態で誰でもGPUを起動できてしまう。
+#
+# ブラウザのSPAからは Cloud Run IAM は使えない（IDトークンの audience が
+# 合わない）ので、アプリ連携時はここを allUsers にし、
+# アプリケーション側の Firebase 認証で守る形になる
 resource "google_cloud_run_v2_service_iam_member" "api_invoker" {
   count = var.api_image == "" ? 0 : 1
 

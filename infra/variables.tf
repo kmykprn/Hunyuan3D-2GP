@@ -75,3 +75,15 @@ variable "job_memory" {
   type        = string
   default     = "32Gi"
 }
+
+variable "enforce_allowlist" {
+  description = "限定公開中は true。config/allowed_uids.json に載っている uid だけを通す"
+  type        = bool
+  default     = true
+}
+
+variable "daily_limit" {
+  description = "1 uid あたりの1日の生成回数。1回あたり約39円かかる"
+  type        = number
+  default     = 10
+}

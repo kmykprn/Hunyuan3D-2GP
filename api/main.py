@@ -13,10 +13,12 @@ import json
 import os
 import uuid
 
+import firebase_admin
 import google.auth
 import google.auth.transport.requests
 import pillow_heif
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from firebase_admin import auth as fb_auth
 from google.cloud import storage
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -36,8 +38,18 @@ JOB_NAME = os.environ["JOB_NAME"]
 # 何も書けないため、これが無いと永遠に running のままになる
 STALE_AFTER = datetime.timedelta(minutes=15)
 
-# 段階3で Firebase のトークンから取る。それまでは固定値
-STAGE1_FIXED_UID = "local-test"
+# 限定公開中は許可リストに載っている uid だけを通す。
+# 製品版では false にする。変わるのはこのフラグと Cloud Run の入口設定だけで、
+# コードの作り直しは発生しない
+ENFORCE_ALLOWLIST = os.environ.get("ENFORCE_ALLOWLIST", "true").lower() == "true"
+
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
+
+# 許可リストは GCS に置く。uid を足すたびに再デプロイしないため。
+# 毎リクエスト読むと待ち時間が延びるので短時間だけ覚えておく
+ALLOWLIST_PATH = "config/allowed_uids.json"
+ALLOWLIST_TTL = datetime.timedelta(seconds=60)
+_allowlist_cache: tuple[datetime.datetime, set] | None = None
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
@@ -55,6 +67,9 @@ SIGNED_URL_TTL = datetime.timedelta(hours=1)
 
 app = FastAPI()
 _storage = storage.Client()
+
+# ADC で初期化する。Cloud Run 上ではサービスアカウントの権限がそのまま使われる
+firebase_admin.initialize_app()
 
 # Cloud Run の管理APIを叩くための認証済みセッション。
 # ジョブの起動と、死活の照会に使う
@@ -176,6 +191,83 @@ def _signed_model_url(job_id: str) -> str:
 # Google Frontend が /healthz を横取りし、アプリに到達する前に
 # HTML の404を返す（アプリ側で登録しても届かない）。
 # SPEC.md は /healthz と書いているが、この環境では実現できない。
+def _uid_from_token(authorization: str | None) -> str:
+    """Authorization ヘッダの Firebase ID トークンを検証して uid を返す。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization ヘッダが無い")
+    try:
+        decoded = fb_auth.verify_id_token(authorization[len("Bearer "):])
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"トークンが無効: {e}")
+    return decoded["uid"]
+
+
+def _allowed_uids() -> set:
+    global _allowlist_cache
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if _allowlist_cache and now - _allowlist_cache[0] < ALLOWLIST_TTL:
+        return _allowlist_cache[1]
+    blob = _bucket().blob(ALLOWLIST_PATH)
+    uids = set(json.loads(blob.download_as_text())) if blob.exists() else set()
+    _allowlist_cache = (now, uids)
+    return uids
+
+
+def _check_allowed(uid: str) -> None:
+    if ENFORCE_ALLOWLIST and uid not in _allowed_uids():
+        raise HTTPException(status_code=403, detail="このアカウントはまだ利用できない")
+
+
+def _active_blob(uid: str):
+    return _bucket().blob(f"quota/{uid}/active.json")
+
+
+def _check_no_active_job(uid: str) -> None:
+    """同じ利用者の並行実行を防ぐ。
+
+    許すとGPUが同時に立ち上がり、事故的に高くつく。
+    """
+    blob = _active_blob(uid)
+    if not blob.exists():
+        return
+    job_id = json.loads(blob.download_as_text()).get("jobId")
+    st = _status_blob(job_id) if job_id else None
+    if st and st.exists():
+        state = json.loads(st.download_as_text())["state"]
+        if state in ("queued", "running"):
+            raise HTTPException(status_code=409, detail=f"生成中のジョブがある: {job_id}")
+    # 終わっているので解放する
+    blob.delete()
+
+
+def _consume_quota(uid: str) -> None:
+    """当日の実行回数を1増やす。上限に達していれば 429。
+
+    generation の指定で競合を検出する。同じ利用者が同時に投げても
+    二重に数え落とさない
+    """
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    blob = _bucket().blob(f"quota/{uid}/{today}.json")
+    if blob.exists():
+        blob.reload()
+        count = json.loads(blob.download_as_text()).get("count", 0)
+        generation = blob.generation
+    else:
+        count, generation = 0, 0
+    if count >= DAILY_LIMIT:
+        raise HTTPException(
+            status_code=429, detail=f"本日の上限（{DAILY_LIMIT}回）に達した"
+        )
+    try:
+        blob.upload_from_string(
+            json.dumps({"count": count + 1}),
+            content_type="application/json",
+            if_generation_match=generation,
+        )
+    except Exception:
+        raise HTTPException(status_code=409, detail="同時に処理されたので、やり直してほしい")
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -224,7 +316,13 @@ def _normalize_image(data: bytes) -> bytes:
 
 
 @app.post("/jobs", status_code=202)
-async def create_job(image: UploadFile = File(...)):
+async def create_job(
+    image: UploadFile = File(...), authorization: str | None = Header(default=None)
+):
+    uid = _uid_from_token(authorization)
+    _check_allowed(uid)
+    _check_no_active_job(uid)
+
     data = await image.read()
     if not data:
         raise HTTPException(status_code=400, detail="画像が空")
@@ -238,8 +336,10 @@ async def create_job(image: UploadFile = File(...)):
     # GPU を起動する前にここで確実に弾く
     png = _normalize_image(data)
 
+    # 画像が正当だと分かってから枠を消費する。壊れた画像で枠を失わせない
+    _consume_quota(uid)
+
     job_id = f"job_{uuid.uuid4().hex[:16]}"
-    uid = STAGE1_FIXED_UID
 
     _bucket().blob(f"jobs/{job_id}/input.png").upload_from_string(
         png, content_type="image/png"
@@ -265,11 +365,15 @@ async def create_job(image: UploadFile = File(...)):
         raise HTTPException(status_code=502, detail=f"ジョブの起動に失敗: {e}")
 
     _write_status(job_id, {**status, "executionName": execution_name})
+    _active_blob(uid).upload_from_string(
+        json.dumps({"jobId": job_id}), content_type="application/json"
+    )
     return {"jobId": job_id}
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str):
+def get_job(job_id: str, authorization: str | None = Header(default=None)):
+    uid = _uid_from_token(authorization)
     blob = _status_blob(job_id)
     if not blob.exists():
         raise HTTPException(status_code=404, detail="そのジョブは存在しない")
@@ -277,7 +381,7 @@ def get_job(job_id: str):
     status = json.loads(blob.download_as_text())
 
     # 他人のジョブは存在自体を隠す（403 ではなく 404）
-    if status.get("uid") != STAGE1_FIXED_UID:
+    if status.get("uid") != uid:
         raise HTTPException(status_code=404, detail="そのジョブは存在しない")
 
     status = _reconcile_if_stale(status)
