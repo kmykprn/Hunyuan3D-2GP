@@ -91,13 +91,22 @@ variable "allowed_origins" {
     API層のCORSと、生成物バケット（署名付きURLでGLBを取る先）の
     両方に同じ値を使う。
 
+    **既定は本番のオリジンだけ。localhost は入れない。**
+    開発中にローカルから実APIを叩く必要が出たときだけ、
+    terraform.tfvars（gitignore 済み）に足して apply し、終わったら戻す。
+
+        allowed_origins = [
+          "https://kmykprn.github.io",
+          "http://localhost:5173",   # 開発中のみ。用が済んだら消す
+        ]
+
+    tfvars に書けばリポジトリには残らないので、消し忘れても
+    次に誰かが apply したときに既定へ戻る。
+
     Capacitor で iOS アプリにするときは capacitor://localhost を足す。
   EOT
   type        = list(string)
-  default = [
-    "https://kmykprn.github.io",
-    "http://localhost:5173",
-  ]
+  default     = ["https://kmykprn.github.io"]
 }
 
 variable "daily_limit" {

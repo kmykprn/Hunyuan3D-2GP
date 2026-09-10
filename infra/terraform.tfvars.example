@@ -11,11 +11,31 @@ region = "asia-southeast1"
 # 超過しても止まらず、通知が飛ぶだけ
 budget_amount = 5000
 
-# Artifact Registry に push したイメージ。最初の apply では空のままでよい
-# image = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/hunyuan3d:v1"
-
-# API を叩く運用者のGoogleアカウント（段階3まではこの人だけが呼べる）
+# API を叩く運用者のGoogleアカウント（public_access = false のとき、この人だけが呼べる）
 operator_email = "you@example.com"
 
-# API層のイメージ。push 前は空のままでよい
-# api_image = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/api:v1"
+# ============================================================
+# ここから下は、既定値のまま apply すると本番の状態を壊すもの。
+# 一度でも本番に apply した環境では、必ず現在の値を書くこと。
+# ============================================================
+
+# Cloud Run の入口を allUsers に開けるか。
+#
+# ★ 既定は false。ブラウザのSPAから叩いている環境で、これを書き忘れたまま
+#   apply すると allUsers が剥がれ、SPAからの呼び出しが全部落ちる。
+#   「CORSを直すだけ」のつもりの apply でも起きるので、原因に辿り着きにくい。
+#
+#   現在の値は state から確認できる:
+#     terraform state show 'google_cloud_run_v2_service_iam_member.api_invoker[0]'
+public_access = true
+
+# Artifact Registry に push したイメージ。最初の apply では空のままでよいが、
+# ★ 一度デプロイした後に空のまま apply すると、動いているイメージが外れる。
+#
+#   いま動いているタグはこれで確認できる（R=リージョン, P=プロジェクトID）:
+#     gcloud run jobs describe hunyuan3d-measure --region=$R --project=$P \
+#       --format='value(spec.template.spec.template.spec.containers[0].image)'
+#     gcloud run services describe hunyuan3d-api --region=$R --project=$P \
+#       --format='value(spec.template.spec.containers[0].image)'
+image     = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/hunyuan3d:v1"
+api_image = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/api:v1"
