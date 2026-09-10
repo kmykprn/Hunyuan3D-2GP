@@ -68,12 +68,54 @@ Authorization: Bearer <Firebase ID トークン>
 → 200 {
     "state": "queued" | "running" | "succeeded" | "failed",
     "createdAt": "2026-09-08T12:00:00Z",
+    "phase": "loading_texture_model",                   // 分かるときだけ
+    "phaseElapsedSeconds": 42,                          // running のときだけ
     "modelUrl": "https://storage.googleapis.com/...",  // succeeded のみ、1時間有効
     "error": "..."                                      // failed のみ
   }
 ```
 
 他人の `jobId` には 404 を返す（存在を隠すため 403 ではなく 404）。
+
+#### `phase` ── いま何をしているか
+
+`state` は4つしかなく、8分間ずっと `running` のままになる。それだけでは
+画面に「動いている」以上のことが出せないので、工程を別に返す。
+
+| `phase` | 意味 | 実測 |
+|---|---|---|
+| （無い） | コンテナ起動待ち | 約25秒 |
+| `preparing` | 入力画像の取得と読み込み開始 | 約15秒 |
+| `loading_texture_model` | テクスチャ生成モデルの読み込み | 185秒 |
+| `loading_shape_model` | 形状生成モデルの読み込み | 78秒 |
+| `generating_shape` | 形を作る（面数削減を含む） | 30〜90秒 |
+| `generating_texture` | 色をつける | 80〜170秒 |
+| `finishing` | 成果物の保存とアップロード | 数秒 |
+
+秒数は目安で、画像によって倍近く変わる。**進捗バーの目盛りには使えるが、
+残り時間の約束には使えない。**
+
+工程は**必ず上から順に進み、戻らない**。ジョブ側が
+`minimal_demo_mmgp.py` の出力を1行ずつ読み、印が出た時点で
+`status.json` に書く（詳細は `worker_entrypoint.py`）。
+
+印は**標準出力と標準エラーにまたがる**。工程の区切りには `print` で
+標準出力に出るものと、`logging` で標準エラーに出るものが混在しており、
+片方だけを見るとその工程が丸ごと落ちる。
+
+**出ない印があっても、そこで止まらない。** 残りの印を全部見るので、
+1つ飛んでも後続の工程は表示される。
+
+`phase` は**必須ではない**。書き込みに失敗しても生成は続けるので、
+`state` だけが返ることはありうる。呼び出し側は無い前提で組むこと。
+
+`phaseElapsedSeconds` は**サーバー側で引いた**秒数。時刻そのものを返して
+端末に引かせると、端末の時計のずれが進捗のずれになる。
+
+**返るのは `running` の間だけ。** 終わったジョブにも返すと、最後の工程に
+入ってからの時間が取得のたびに伸び続け、「テクスチャ生成に3日かかっている」
+ような表示になる。`phase` 自体は `failed` の原因を絞るのに使えるので、
+終わったあとも返す。
 
 ### `GET /health`
 
@@ -163,6 +205,8 @@ API はこのバケットに読み取り権限しか持たず、書き込みは�
   "jobId": "job_7f3a2b...",
   "uid": "AbCdEf...",
   "state": "running",
+  "phase": "loading_shape_model",
+  "phaseStartedAt": "2026-09-08T12:04:12Z",
   "createdAt": "2026-09-08T12:00:00Z",
   "updatedAt": "2026-09-08T12:04:31Z",
   "executionName": "projects/.../executions/hunyuan3d-job-x7k2m",

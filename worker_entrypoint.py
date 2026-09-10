@@ -18,15 +18,18 @@
 # ただし OOM の signal 9 のように、ここで何も書けずに死ぬ落ち方も実在する
 # （PR #6 の実測で踏んだ）。そちらは API 層の失敗検知が拾う。
 
+import collections
 import datetime
 import glob
 import json
 import os
 import subprocess
 import sys
+import threading
 import traceback
 from urllib.request import Request, urlopen
 
+from google.api_core.exceptions import PreconditionFailed
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
 from google.oauth2 import id_token
@@ -51,19 +54,133 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
+# status.json の書き込みを諦めるまでの回数。競合は API 層の書き込みと
+# 重なった一瞬だけなので、数回やり直せば必ず通る
+STATUS_WRITE_ATTEMPTS = 5
+
+
 def _update_status(job_id: str, **changes) -> None:
     """status.json を読んで変更を反映して書き戻す。
 
     API 層が書いた createdAt や uid を消さないよう、全体を上書きせず
     読んでからマージする。
+
+    **条件付き書き込みにするのは、書き手が2つあるため。** ジョブの起動直後、
+    API 層は executionName と slot を status に書く。こちらが素の上書きで
+    書き戻すと、読んでから書くまでの間に入ったその記録を消してしまう。
+    executionName が消えると、ジョブが応答しなくなったときに死活を
+    照会できず、GPU の実行枠を回収する判断ができなくなる。
     """
     blob = _bucket.blob(f"jobs/{job_id}/status.json")
-    status = json.loads(blob.download_as_text())
-    status.update(changes)
-    status["updatedAt"] = _now()
-    blob.upload_from_string(
-        json.dumps(status, ensure_ascii=False), content_type="application/json"
-    )
+    for _ in range(STATUS_WRITE_ATTEMPTS):
+        blob.reload()
+        generation = blob.generation
+        status = json.loads(blob.download_as_text())
+        status.update(changes)
+        status["updatedAt"] = _now()
+        try:
+            blob.upload_from_string(
+                json.dumps(status, ensure_ascii=False),
+                content_type="application/json",
+                if_generation_match=generation,
+            )
+            return
+        except PreconditionFailed:
+            # 読んでから書くまでの間に誰かが書いた。読み直してやり直す
+            pass
+    raise RuntimeError(f"status.json を更新できなかった: {job_id}")
+
+
+# 生成の工程。minimal_demo_mmgp.py が出す印と、状態に書く名前の対。
+#
+# 印は標準出力と標準エラーに**またがる**。工程の区切りには print で
+# 標準出力に出るものと、logging で標準エラーに出るものが混在している。
+# どちらか片方だけを見ると、その工程が丸ごと落ちる。
+PHASE_MARKERS: tuple[tuple[str, str], ...] = (
+    ("=== Loading texture generation model ===", "loading_texture_model"),
+    ("=== Loading i23d model ===", "loading_shape_model"),
+    ("Generating 3D model with texture...", "generating_shape"),
+    # 標準エラー側。--texture が通る generation_all() には
+    # テクスチャ開始を告げる print が無いので、面数削減の完了を知らせる
+    # このログを開始点として使う。
+    #
+    # print("Generating texture...") は存在するが、そちらは
+    # generate_3d_cli() の中、しかも generate_texture=True のときだけで、
+    # --texture の経路からは呼ばれない。実機で工程が止まって気付いた
+    ("---Face Reduction takes", "generating_texture"),
+    ("3D model with texture generated successfully!", "finishing"),
+)
+
+# 標準エラーのうち手元に残す行数。失敗の理由に使うのは末尾だけで、
+# 全文は素通し済みなので Cloud Logging にある
+STDERR_KEEP_LINES = 200
+
+# 残す1行の長さの上限。tqdm の進捗表示は改行なしで伸び続けるため、
+# 行数だけで抑えても1行が巨大になりうる
+STDERR_KEEP_CHARS = 2000
+
+
+def _set_phase(job_id: str, phase: str) -> None:
+    """いまの工程を状態に書く。
+
+    書けなくても生成は続ける。1回およそ40円かかる処理を、
+    進捗表示のために落とすのは割に合わない。
+    """
+    try:
+        _update_status(job_id, phase=phase, phaseStartedAt=_now())
+    except Exception:
+        traceback.print_exc()
+
+
+class PhaseTracker:
+    """行を食わせると、工程が進んだときだけ状態に書く。
+
+    **前にしか進まない。** 既に通り過ぎた印は見ないので、ログに同じ文字列が
+    再び現れても工程は巻き戻らない。
+
+    **残りの印を全部見る。** 次の1つだけを待つと、出ない印があったときに
+    そこで止まり、以降の工程が全部落ちる。実際 --texture の経路には
+    出ない印があり、テクスチャ生成も仕上げも表示されなくなっていた。
+
+    標準出力と標準エラーの2スレッドから食わせるので、位置は錠で守る。
+    """
+
+    def __init__(self, job_id: str) -> None:
+        self._job_id = job_id
+        self._index = 0
+        self._lock = threading.Lock()
+
+    def feed(self, line: str) -> None:
+        phase = None
+        with self._lock:
+            for offset in range(self._index, len(PHASE_MARKERS)):
+                marker, candidate = PHASE_MARKERS[offset]
+                if marker in line:
+                    self._index = offset + 1
+                    phase = candidate
+                    break
+        # 書き込みは錠の外でやる。GCS への往復を錠の中に入れると、
+        # その間もう一方のスレッドが読み進められなくなる
+        if phase:
+            _set_phase(self._job_id, phase)
+
+
+def _drain_stderr(stream, keep: collections.deque, phases: "PhaseTracker") -> None:
+    """標準エラーを読み続け、素通ししつつ末尾だけ残す。
+
+    別スレッドにするのは**デッドロックを避けるため**。標準出力を1行ずつ
+    読んでいる間に標準エラー側のパイプ（64KB）が埋まると、子は書き込みで
+    止まり、親は標準出力の続きを待ち続けて、両者が動かなくなる。
+
+    全文を溜めないのは 16GiB しかないメモリを守るため。従来の
+    subprocess.run(stderr=PIPE) は全文をメモリに持っていたので、
+    ここは以前より軽くなっている。
+    """
+    for line in stream:
+        sys.stderr.write(line)
+        keep.append(line.rstrip()[:STDERR_KEEP_CHARS])
+        phases.feed(line)
+    sys.stderr.flush()
 
 
 def _notify_dispatcher() -> None:
@@ -94,7 +211,7 @@ def main() -> int:
     input_path = f"/tmp/{job_id}_input.png"
 
     try:
-        _update_status(job_id, state="running")
+        _update_status(job_id, state="running", phase="preparing", phaseStartedAt=_now())
     except Exception:
         # ここで失敗すると状態を一切更新できないので、諦めて落ちる。
         # API 層の失敗検知が拾う
@@ -108,10 +225,18 @@ def main() -> int:
         src.download_to_filename(input_path)
 
         # 別プロセスにするのは、minimal_demo_mmgp.py が終了時フックや
-        # グローバル状態を持っており、import して呼ぶと副作用が読みにくいため
-        result = subprocess.run(
+        # グローバル状態を持っており、import して呼ぶと副作用が読みにくいため。
+        #
+        # 標準出力を捕まえるのは、工程の切り替わりを拾って status.json に
+        # 書くため。**1行読んだらその場で素通しし、溜めない。** 溜めると
+        # 親が全出力をメモリに持つことになり、余裕の無いメモリを圧迫する
+        # （実測で OOM の一因になった）
+        process = subprocess.Popen(
             [
                 sys.executable,
+                # 出力を行ごとに流させる。既定のままだと標準出力がパイプ相手に
+                # ブロックバッファされ、工程の印が数KB溜まるまで届かない
+                "-u",
                 "minimal_demo_mmgp.py",
                 "--input-image", input_path,
                 "--output", "/tmp/output",
@@ -119,19 +244,37 @@ def main() -> int:
                 "--profile", "3",
             ],
             cwd=REPO_DIR,
-            # 標準出力は素通しする。捕まえると親が全部メモリに溜め、
-            # ただでさえ余裕の無いメモリを圧迫する（実測でOOMの一因になった）。
-            # 標準エラーだけは失敗理由に使うので捕まえる。こちらは量が少ない
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,
         )
-        if result.returncode != 0:
-            if result.returncode == -9:
+
+        phases = PhaseTracker(job_id)
+        stderr_tail: collections.deque = collections.deque(maxlen=STDERR_KEEP_LINES)
+        stderr_reader = threading.Thread(
+            target=_drain_stderr, args=(process.stderr, stderr_tail, phases), daemon=True
+        )
+        stderr_reader.start()
+
+        for line in process.stdout:
+            # まず素通し。Cloud Logging に出る内容は今までと変わらない
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            phases.feed(line)
+
+        process.stdout.close()
+        returncode = process.wait()
+        # 子が終わればパイプは閉じるので、読み手もすぐ抜ける。
+        # 万一抜けなければ待ち続けても仕方がないので打ち切る
+        stderr_reader.join(timeout=30)
+
+        if returncode != 0:
+            if returncode == -9:
                 # OOM による SIGKILL。この落ち方では stderr も残らない
                 raise RuntimeError("メモリ不足で強制終了された")
             # 最後の例外行だけを理由にする。全文は Cloud Logging にある
-            print(result.stderr, file=sys.stderr)
-            lines = [ln for ln in (result.stderr or "").strip().splitlines() if ln and not ln.startswith(" ")]
+            lines = [ln for ln in stderr_tail if ln and not ln.startswith(" ")]
             detail = lines[-1] if lines else "詳細はログを参照"
             raise RuntimeError(f"生成に失敗: {detail}")
 
