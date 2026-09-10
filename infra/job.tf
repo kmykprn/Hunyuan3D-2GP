@@ -164,9 +164,19 @@ resource "google_cloud_run_v2_job" "measure" {
         }
 
         # 完了時に API へ通知し、空いた枠で次の待機ジョブを始める。
+        #
+        # **API サービスは count 付き**（api_image が空なら作られない）なので、
+        # そのまま [0] を書くと Invalid index で apply ごと落ちる。
+        # イメージを push する前に apply する手順が variables.tf に書いてあり、
+        # そこを通れない。空を渡せばワーカー側が通知を諦めるだけで済むので、
+        # サービスが無いときは空にする（枠の回収は get_job 側の経路が拾う）
         env {
-          name  = "API_URL"
-          value = google_cloud_run_v2_service.api[0].uri
+          name = "API_URL"
+          value = (
+            length(google_cloud_run_v2_service.api) > 0
+            ? google_cloud_run_v2_service.api[0].uri
+            : ""
+          )
         }
 
         env {
