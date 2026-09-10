@@ -30,13 +30,9 @@ class Multiview_Diffusion_Net():
         current_file_path = os.path.abspath(__file__)
         custom_pipeline_path = os.path.join(os.path.dirname(current_file_path), '..', 'hunyuanpaint')
 
-        # custom_pipeline_path 配下の pipeline.py はリポジトリ同梱のコードだが、
-        # diffusers はカスタムパイプラインの読み込みに trust_remote_code を要求する。
-        # 指定しないと texgen のロードが失敗し、テクスチャ生成が丸ごと無効になる。
         pipeline = DiffusionPipeline.from_pretrained(
             multiview_ckpt_path,
-            custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16,
-            trust_remote_code=True)
+            custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16)
 
         pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config,
                                                                          timestep_spacing='trailing')

@@ -172,8 +172,3 @@ cckiro
 .claude
 knowledge
 
-
-# Cloud Run 移植の事前計測（CLOUDRUN_MEASURE.md）の出力
-measure_result.txt
-measure_*.log
-output/
