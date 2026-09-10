@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.cloud import storage
+from google.oauth2 import id_token
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 # iPhone が既定で送る HEIC/HEIF を Pillow で開けるようにする。
@@ -52,6 +53,11 @@ DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "10"))
 # 無いと、生成に向かない画像で延々と再試行でき、そのたびGPUが起動する
 DAILY_ATTEMPT_LIMIT = int(os.environ.get("DAILY_ATTEMPT_LIMIT", "20"))
 
+# GPU の同時実行数は、利用者単位ではなくプロジェクト全体で制限する。
+# L4 の初期割り当ては3枚だが、障害対応用に1枚の余白を残して2本にする。
+MAX_RUNNING_JOBS = int(os.environ.get("MAX_RUNNING_JOBS", "2"))
+MAX_QUEUED_JOBS_PER_UID = int(os.environ.get("MAX_QUEUED_JOBS_PER_UID", "5"))
+
 # 許可リストは GCS に置く。uid を足すたびに再デプロイしないため。
 # 毎リクエスト読むと待ち時間が延びるので短時間だけ覚えておく
 # 生成物バケットとは別のバケットに置く。API はこちらに読み取り権限しか持たない。
@@ -66,6 +72,8 @@ _allowlist_cache: tuple[datetime.datetime, set] | None = None
 # 状態を問わず生きているものとして扱う。
 # 逆に、枠を取った直後にインスタンスが死んだ場合はこの時間で解放される
 SLOT_GRACE = datetime.timedelta(seconds=60)
+DISPATCH_CLAIM_TTL = datetime.timedelta(seconds=60)
+DISPATCHER_SERVICE_ACCOUNT = os.environ["DISPATCHER_SERVICE_ACCOUNT"]
 
 # ブラウザから叩けるようにする（curl では要らないので、実装当初は抜けていた）。
 # アプリは GitHub Pages、APIは Cloud Run と**別オリジン**なので、
@@ -124,7 +132,7 @@ _JOB_BASE = (
 )
 
 
-def _start_job(job_id: str) -> str:
+def _start_job(job_id: str, slot: int) -> str:
     """ジョブを起動し、execution 名を返す。
 
     どの入力を処理するかは環境変数の上書きで伝える。ジョブ側は
@@ -135,7 +143,12 @@ def _start_job(job_id: str) -> str:
         json={
             "overrides": {
                 "containerOverrides": [
-                    {"env": [{"name": "JOB_ID", "value": job_id}]}
+                    {
+                        "env": [
+                            {"name": "JOB_ID", "value": job_id},
+                            {"name": "JOB_SLOT", "value": str(slot)},
+                        ]
+                    }
                 ]
             }
         },
@@ -272,20 +285,6 @@ def _check_allowed(uid: str) -> None:
         raise HTTPException(status_code=403, detail="このアカウントはまだ利用できない")
 
 
-def _active_blob(uid: str):
-    return _bucket().blob(f"quota/{uid}/active.json")
-
-
-def _job_is_running(job_id: str | None) -> bool:
-    """そのジョブがまだ動いているか。状態が読めないものは動いていない扱い。"""
-    if not job_id:
-        return False
-    blob = _status_blob(job_id)
-    if not blob.exists():
-        return False
-    return json.loads(blob.download_as_text())["state"] in ("queued", "running")
-
-
 def _read_slot(blob) -> tuple[dict, int | None]:
     """枠の中身と generation を返す。
 
@@ -302,78 +301,220 @@ def _read_slot(blob) -> tuple[dict, int | None]:
         return {}, blob.generation
 
 
-def _slot_is_fresh(claimed_at: str | None) -> bool:
-    """取り立ての枠か。status.json が書かれる前の隙間を守るための判定。"""
+def _slot_is_fresh(claimed_at: str | None, ttl: datetime.timedelta = SLOT_GRACE) -> bool:
+    """直前に確保された枠か。途中状態を別の処理が奪わないための判定。"""
     if not claimed_at:
         return False
     try:
         claimed = datetime.datetime.fromisoformat(claimed_at)
     except ValueError:
         return False
-    return datetime.datetime.now(datetime.timezone.utc) - claimed < SLOT_GRACE
+    return datetime.datetime.now(datetime.timezone.utc) - claimed < ttl
 
 
-def _claim_slot(uid: str, job_id: str) -> int:
-    """この利用者の実行枠を確保する。埋まっていれば 409。
+def _queued_count_blob(uid: str):
+    return _bucket().blob(f"quota/{uid}/queued.json")
 
-    並行実行を許すとGPUが同時に立ち上がり、事故的に高くつく。
 
-    「存在を確かめてから書く」ではなく、**GCS の条件付き書き込みで確保する**。
-    if_generation_match=0 は「まだ無いときだけ作る」で、これが排他ロックになる。
-    確認と書き込みを分けると、その間に通った2件目が同時にGPUを立ち上げる。
-    ジョブの起動には数秒かかるので窓が広く、ボタンの二度押しで踏む。
-    """
-    blob = _active_blob(uid)
-    payload = json.dumps({"jobId": job_id, "claimedAt": _now()})
-
-    # 取れなかった理由は「まだ動いている」か「終わったのに枠が残っている」の
-    # どちらか。後者なら1度だけ解放して取り直す（無限には繰り返さない）
-    for attempt in (1, 2):
+def _reserve_queue_space(uid: str) -> None:
+    """利用者ごとの待機上限を、GCS の CAS で超えないように確保する。"""
+    blob = _queued_count_blob(uid)
+    for _ in range(3):
+        data, generation = _read_slot(blob)
+        count = data.get("count", 0)
+        if count >= MAX_QUEUED_JOBS_PER_UID:
+            raise HTTPException(
+                status_code=429,
+                detail=f"同時に受け付けられる作成は{MAX_QUEUED_JOBS_PER_UID}件までです",
+            )
         try:
             blob.upload_from_string(
-                payload, content_type="application/json", if_generation_match=0
+                json.dumps({"count": count + 1}),
+                content_type="application/json",
+                if_generation_match=generation or 0,
             )
-            # 解放するときに「自分が取った枠か」を確かめるために覚えておく
-            return blob.generation
+            return
+        except PreconditionFailed:
+            pass
+    raise HTTPException(status_code=409, detail="同時に処理されたので、やり直してほしい")
+
+
+def _release_queue_space(uid: str) -> None:
+    """開始済みまたは失敗したジョブの待機枠を返す。"""
+    blob = _queued_count_blob(uid)
+    for _ in range(3):
+        data, generation = _read_slot(blob)
+        count = data.get("count", 0)
+        if generation is None or count <= 0:
+            return
+        try:
+            blob.upload_from_string(
+                json.dumps({"count": count - 1}),
+                content_type="application/json",
+                if_generation_match=generation,
+            )
+            return
         except PreconditionFailed:
             pass
 
-        slot, generation = _read_slot(blob)
-        if generation is None:
-            # 読みに行く間に解放された。空いたので取り直す
-            continue
 
-        holder = slot.get("jobId")
-        # 取り立ての枠は、status.json がまだ無くても生きているものとして扱う
-        if _slot_is_fresh(slot.get("claimedAt")) or (holder and _job_is_running(holder)):
-            raise HTTPException(
-                status_code=409, detail=f"生成中のジョブがある: {holder}"
+def _global_slot_blob(slot: int):
+    return _bucket().blob(f"queue/slots/{slot}.json")
+
+
+def _claim_global_slot(job_id: str) -> int | None:
+    """空いている GPU 実行枠を1つだけ確保する。"""
+    for slot in range(MAX_RUNNING_JOBS):
+        blob = _global_slot_blob(slot)
+        try:
+            blob.upload_from_string(
+                json.dumps({"jobId": job_id, "claimedAt": _now()}),
+                content_type="application/json",
+                if_generation_match=0,
             )
+            return slot
+        except PreconditionFailed:
+            pass
+    return None
 
-        if attempt == 1:
-            # 終わったジョブが枠を握ったままなので解放する。
-            # generation を指定するので、その隙に他が取っていれば空振りする
-            try:
-                blob.delete(if_generation_match=generation)
-            except (PreconditionFailed, NotFound):
-                pass
 
-    raise HTTPException(
-        status_code=409, detail="実行枠を確保できなかった。少し待ってやり直してほしい"
+def _release_global_slot(slot: int, job_id: str) -> None:
+    """自分のジョブが保持する実行枠だけを解放する。"""
+    blob = _global_slot_blob(slot)
+    data, generation = _read_slot(blob)
+    if generation is None or data.get("jobId") != job_id:
+        return
+    try:
+        blob.delete(if_generation_match=generation)
+    except (PreconditionFailed, NotFound):
+        pass
+
+
+def _oldest_queued_job() -> dict | None:
+    """まだ起動していないジョブから、最も古いものを選ぶ。"""
+    candidates = []
+    for blob in _bucket().list_blobs(prefix="jobs/"):
+        if not blob.name.endswith("/status.json"):
+            continue
+        try:
+            status = json.loads(blob.download_as_text())
+        except ValueError:
+            continue
+        if status.get("state") != "queued" or status.get("executionName"):
+            continue
+        if _slot_is_fresh(status.get("dispatchClaimedAt"), DISPATCH_CLAIM_TTL):
+            continue
+        candidates.append(status)
+    return min(candidates, key=lambda status: status["createdAt"], default=None)
+
+
+def _claim_dispatch(job_id: str) -> dict | None:
+    """同じ待機ジョブを複数の API インスタンスが起動しないよう予約する。"""
+    blob = _status_blob(job_id)
+    data, generation = _read_slot(blob)
+    if generation is None or data.get("state") != "queued" or data.get("executionName"):
+        return None
+    if _slot_is_fresh(data.get("dispatchClaimedAt"), DISPATCH_CLAIM_TTL):
+        return None
+    data["dispatchClaimedAt"] = _now()
+    try:
+        blob.upload_from_string(
+            json.dumps(data, ensure_ascii=False),
+            content_type="application/json",
+            if_generation_match=generation,
+        )
+    except PreconditionFailed:
+        return None
+    return data
+
+
+def _clear_dispatch_claim(job_id: str, claimed_at: str) -> None:
+    """GPU 枠を取れなかったジョブを、次回のディスパッチ対象へ戻す。"""
+    blob = _status_blob(job_id)
+    data, generation = _read_slot(blob)
+    if generation is None or data.get("dispatchClaimedAt") != claimed_at:
+        return
+    data.pop("dispatchClaimedAt", None)
+    try:
+        blob.upload_from_string(
+            json.dumps(data, ensure_ascii=False),
+            content_type="application/json",
+            if_generation_match=generation,
+        )
+    except PreconditionFailed:
+        pass
+
+
+def _record_execution(job_id: str, slot: int, execution_name: str) -> None:
+    """起動済みの記録を残す。ワーカーの running 更新を上書きしない。"""
+    blob = _status_blob(job_id)
+    for _ in range(3):
+        data, generation = _read_slot(blob)
+        if generation is None:
+            return
+        data["executionName"] = execution_name
+        data["slot"] = slot
+        data.pop("dispatchClaimedAt", None)
+        try:
+            blob.upload_from_string(
+                json.dumps(data, ensure_ascii=False),
+                content_type="application/json",
+                if_generation_match=generation,
+            )
+            return
+        except PreconditionFailed:
+            pass
+
+
+def _release_finished_global_slots() -> None:
+    """正常終了・失敗済みジョブの枠を回収する。"""
+    for slot in range(MAX_RUNNING_JOBS):
+        data, _ = _read_slot(_global_slot_blob(slot))
+        job_id = data.get("jobId")
+        if not job_id:
+            continue
+        status, _ = _read_slot(_status_blob(job_id))
+        if status.get("state") in ("succeeded", "failed"):
+            _release_global_slot(slot, job_id)
+
+
+def _mark_start_failed(status: dict, slot: int, error: Exception) -> None:
+    """Cloud Run Job を起動できなかった待機ジョブを終了扱いにする。"""
+    _release_global_slot(slot, status["jobId"])
+    _release_queue_space(status["uid"])
+    _restore_quota(status["uid"])
+    _write_status(
+        status["jobId"],
+        {
+            **status,
+            "state": "failed",
+            "error": f"ジョブの起動に失敗: {error}",
+            "quotaRestored": True,
+        },
     )
 
 
-def _release_slot(uid: str, generation: int) -> None:
-    """自分が取った実行枠を解放する。
-
-    generation を指定するのは、既に別のリクエストが取り直した枠を
-    誤って消さないため。解放しきれなくても、次の投稿が終了済みと
-    判断して解放するので詰まりはしない。
-    """
-    try:
-        _active_blob(uid).delete(if_generation_match=generation)
-    except (PreconditionFailed, NotFound):
-        pass
+def _dispatch_queued_jobs() -> None:
+    """空き GPU 枠を、古い待機ジョブから順に埋める。"""
+    _release_finished_global_slots()
+    while True:
+        candidate = _oldest_queued_job()
+        if not candidate:
+            return
+        claimed = _claim_dispatch(candidate["jobId"])
+        if not claimed:
+            continue
+        slot = _claim_global_slot(claimed["jobId"])
+        if slot is None:
+            _clear_dispatch_claim(claimed["jobId"], claimed["dispatchClaimedAt"])
+            return
+        try:
+            execution_name = _start_job(claimed["jobId"], slot)
+        except Exception as error:
+            _mark_start_failed(claimed, slot, error)
+            continue
+        _record_execution(claimed["jobId"], slot, execution_name)
+        _release_queue_space(claimed["uid"])
 
 
 def _quota_blob(uid: str):
@@ -476,8 +617,30 @@ def _restore_quota_if_failed(status: dict) -> dict:
     return status
 
 
+def _check_dispatcher(authorization: str | None) -> None:
+    """完了通知は GPU ワーカーのサービスアカウントだけに限定する。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization ヘッダが無い")
+    try:
+        claims = id_token.verify_oauth2_token(
+            authorization[len("Bearer "):], google.auth.transport.requests.Request()
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="ワーカー認証が無効")
+    if claims.get("email") != DISPATCHER_SERVICE_ACCOUNT or not claims.get("email_verified"):
+        raise HTTPException(status_code=403, detail="ワーカー認証が許可されていない")
+
+
 @app.get("/health")
 def health():
+    return {"ok": True}
+
+
+@app.post("/internal/dispatch")
+def dispatch(authorization: str | None = Header(default=None)):
+    """GPU ワーカーの完了通知で、空いた枠に次の待機ジョブを割り当てる。"""
+    _check_dispatcher(authorization)
+    _dispatch_queued_jobs()
     return {"ok": True}
 
 
@@ -545,12 +708,15 @@ async def create_job(
 
     job_id = f"job_{uuid.uuid4().hex[:16]}"
 
-    # 画像が正当だと分かってから枠を取る。壊れた画像で枠を失わせない。
-    # 確保はジョブの起動より先に済ませる。あとに回すと、起動にかかる数秒の間に
-    # 2件目が通ってGPUが2本立つ
-    slot_generation = _claim_slot(uid, job_id)
+    # 正当な画像だけを待機列に受け付ける。1利用者が待機枠を独占しないよう、
+    # 待機上限も GCS の条件付き書き込みで確保する。
+    queue_reserved = False
+    quota_consumed = False
     try:
+        _reserve_queue_space(uid)
+        queue_reserved = True
         _consume_quota(uid)
+        quota_consumed = True
 
         _bucket().blob(f"jobs/{job_id}/input.png").upload_from_string(
             png, content_type="image/png"
@@ -568,22 +734,17 @@ async def create_job(
         }
         _write_status(job_id, status)
 
+        # 空き GPU があればこのジョブを、なければ既存の先頭ジョブを起動する。
+        # 一時的なディスパッチ失敗では受付を取り消さず、次の通知で再試行する。
         try:
-            execution_name = _start_job(job_id)
-        except Exception as e:
-            # 起動できなかったことを状態に残す。残さないと queued のまま放置される
-            _write_status(
-                job_id, {**status, "state": "failed", "error": f"ジョブの起動に失敗: {e}"}
-            )
-            # 起動していないので枠を返す。生成できていないのに1回分を失わせない
-            _restore_quota(uid)
-            raise HTTPException(status_code=502, detail=f"ジョブの起動に失敗: {e}")
-
-        _write_status(job_id, {**status, "executionName": execution_name})
+            _dispatch_queued_jobs()
+        except Exception:
+            pass
     except Exception:
-        # ここまでに失敗したなら、そのジョブは動いていない。
-        # 枠を握ったままにすると、次の投稿まで利用者が締め出される
-        _release_slot(uid, slot_generation)
+        if quota_consumed:
+            _restore_quota(uid)
+        if queue_reserved:
+            _release_queue_space(uid)
         raise
 
     return {"jobId": job_id}
@@ -605,6 +766,11 @@ def get_job(job_id: str, authorization: str | None = Header(default=None)):
 
     status = _reconcile_if_stale(status)
     status = _restore_quota_if_failed(status)
+
+    # OOM などでワーカー自身が完了通知を送れなかった場合も、状態を見に来た
+    # タイミングで終了済み枠を回収し、次の待機ジョブを進める。
+    if status["state"] in ("succeeded", "failed"):
+        _dispatch_queued_jobs()
 
     body = {
         "state": status["state"],

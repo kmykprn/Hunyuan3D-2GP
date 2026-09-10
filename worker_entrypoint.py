@@ -25,11 +25,15 @@ import os
 import subprocess
 import sys
 import traceback
+from urllib.request import Request, urlopen
 
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
+from google.oauth2 import id_token
 
 REPO_DIR = "/app"
 OUTPUTS_BUCKET = os.environ["OUTPUTS_BUCKET"]
+API_URL = os.environ.get("API_URL", "").rstrip("/")
 
 _storage = storage.Client()
 _bucket = _storage.bucket(OUTPUTS_BUCKET)
@@ -58,6 +62,25 @@ def _update_status(job_id: str, **changes) -> None:
     blob.upload_from_string(
         json.dumps(status, ensure_ascii=False), content_type="application/json"
     )
+
+
+def _notify_dispatcher() -> None:
+    """完了を API に伝え、空いた GPU 枠で次の受付済み作成を始める。"""
+    if not API_URL:
+        return
+    try:
+        token = id_token.fetch_id_token(GoogleAuthRequest(), API_URL)
+        request = Request(
+            f"{API_URL}/internal/dispatch",
+            data=b"",
+            headers={"Authorization": f"Bearer {token}"},
+            method="POST",
+        )
+        with urlopen(request, timeout=30):
+            pass
+    except Exception:
+        # 通知に失敗しても生成結果は残す。次の API リクエストで再試行される。
+        traceback.print_exc()
 
 
 def main() -> int:
@@ -123,6 +146,7 @@ def main() -> int:
 
         _bucket.blob(f"jobs/{job_id}/model.glb").upload_from_filename(produced[0])
         _update_status(job_id, state="succeeded", error=None)
+        _notify_dispatcher()
         print(f"完了: {job_id}")
         return 0
 
@@ -132,6 +156,7 @@ def main() -> int:
             _update_status(job_id, state="failed", error=str(e)[:500])
         except Exception:
             traceback.print_exc()
+        _notify_dispatcher()
         return 1
 
 

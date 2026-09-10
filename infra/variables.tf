@@ -127,6 +127,28 @@ variable "daily_attempt_limit" {
   default     = 20
 }
 
+variable "max_running_jobs" {
+  description = "プロジェクト全体で同時に GPU を使う生成数。L4 の初期枠3枚に対し、障害対応用の余白を1枚残す"
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.max_running_jobs >= 1 && floor(var.max_running_jobs) == var.max_running_jobs
+    error_message = "max_running_jobs は1以上の整数にする。"
+  }
+}
+
+variable "max_queued_jobs_per_uid" {
+  description = "1 uid が同時に待機できる生成数。待機列の独占を防ぐ"
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.max_queued_jobs_per_uid >= 1 && floor(var.max_queued_jobs_per_uid) == var.max_queued_jobs_per_uid
+    error_message = "max_queued_jobs_per_uid は1以上の整数にする。"
+  }
+}
+
 variable "public_access" {
   description = <<-EOT
     Cloud Run の入口を開けるか。

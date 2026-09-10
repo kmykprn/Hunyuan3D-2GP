@@ -101,6 +101,21 @@ resource "google_cloud_run_v2_service" "api" {
       }
 
       env {
+        name  = "MAX_RUNNING_JOBS"
+        value = tostring(var.max_running_jobs)
+      }
+
+      env {
+        name  = "MAX_QUEUED_JOBS_PER_UID"
+        value = tostring(var.max_queued_jobs_per_uid)
+      }
+
+      env {
+        name  = "DISPATCHER_SERVICE_ACCOUNT"
+        value = google_service_account.job.email
+      }
+
+      env {
         name  = "CONFIG_BUCKET"
         value = google_storage_bucket.config.name
       }

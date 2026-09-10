@@ -163,6 +163,12 @@ resource "google_cloud_run_v2_job" "measure" {
           value = google_storage_bucket.outputs.name
         }
 
+        # 完了時に API へ通知し、空いた枠で次の待機ジョブを始める。
+        env {
+          name  = "API_URL"
+          value = google_cloud_run_v2_service.api[0].uri
+        }
+
 
         volume_mounts {
           name       = "weights"
