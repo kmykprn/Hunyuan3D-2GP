@@ -18,12 +18,14 @@
 # ただし OOM の signal 9 のように、ここで何も書けずに死ぬ落ち方も実在する
 # （PR #6 の実測で踏んだ）。そちらは API 層の失敗検知が拾う。
 
+import collections
 import datetime
 import glob
 import json
 import os
 import subprocess
 import sys
+import threading
 import traceback
 
 from google.cloud import storage
@@ -60,6 +62,57 @@ def _update_status(job_id: str, **changes) -> None:
     )
 
 
+# 生成の工程。minimal_demo_mmgp.py が標準出力に出す印と、状態に書く名前の対。
+#
+# **前から順に1つずつしか探さない。** 全行を全印と照合すると、ログに
+# たまたま同じ文字列が現れたときに工程が巻き戻る。生成は一本道なので、
+# 次に来るはずの印だけを待てばよい。
+PHASE_MARKERS: tuple[tuple[str, str], ...] = (
+    ("=== Loading texture generation model ===", "loading_texture_model"),
+    ("=== Loading i23d model ===", "loading_shape_model"),
+    ("Generating 3D model with texture...", "generating_shape"),
+    ("Generating texture...", "generating_texture"),
+    ("3D model with texture generated successfully!", "finishing"),
+)
+
+# 標準エラーのうち手元に残す行数。失敗の理由に使うのは末尾だけで、
+# 全文は素通し済みなので Cloud Logging にある
+STDERR_KEEP_LINES = 200
+
+# 残す1行の長さの上限。tqdm の進捗表示は改行なしで伸び続けるため、
+# 行数だけで抑えても1行が巨大になりうる
+STDERR_KEEP_CHARS = 2000
+
+
+def _set_phase(job_id: str, phase: str) -> None:
+    """いまの工程を状態に書く。
+
+    書けなくても生成は続ける。1回およそ40円かかる処理を、
+    進捗表示のために落とすのは割に合わない。
+    """
+    try:
+        _update_status(job_id, phase=phase, phaseStartedAt=_now())
+    except Exception:
+        traceback.print_exc()
+
+
+def _drain_stderr(stream, keep: collections.deque) -> None:
+    """標準エラーを読み続け、素通ししつつ末尾だけ残す。
+
+    別スレッドにするのは**デッドロックを避けるため**。標準出力を1行ずつ
+    読んでいる間に標準エラー側のパイプ（64KB）が埋まると、子は書き込みで
+    止まり、親は標準出力の続きを待ち続けて、両者が動かなくなる。
+
+    全文を溜めないのは 16GiB しかないメモリを守るため。従来の
+    subprocess.run(stderr=PIPE) は全文をメモリに持っていたので、
+    ここは以前より軽くなっている。
+    """
+    for line in stream:
+        sys.stderr.write(line)
+        keep.append(line.rstrip()[:STDERR_KEEP_CHARS])
+    sys.stderr.flush()
+
+
 def main() -> int:
     job_id = os.environ.get("JOB_ID")
     if not job_id:
@@ -69,7 +122,7 @@ def main() -> int:
     input_path = f"/tmp/{job_id}_input.png"
 
     try:
-        _update_status(job_id, state="running")
+        _update_status(job_id, state="running", phase="preparing", phaseStartedAt=_now())
     except Exception:
         # ここで失敗すると状態を一切更新できないので、諦めて落ちる。
         # API 層の失敗検知が拾う
@@ -83,10 +136,18 @@ def main() -> int:
         src.download_to_filename(input_path)
 
         # 別プロセスにするのは、minimal_demo_mmgp.py が終了時フックや
-        # グローバル状態を持っており、import して呼ぶと副作用が読みにくいため
-        result = subprocess.run(
+        # グローバル状態を持っており、import して呼ぶと副作用が読みにくいため。
+        #
+        # 標準出力を捕まえるのは、工程の切り替わりを拾って status.json に
+        # 書くため。**1行読んだらその場で素通しし、溜めない。** 溜めると
+        # 親が全出力をメモリに持つことになり、余裕の無いメモリを圧迫する
+        # （実測で OOM の一因になった）
+        process = subprocess.Popen(
             [
                 sys.executable,
+                # 出力を行ごとに流させる。既定のままだと標準出力がパイプ相手に
+                # ブロックバッファされ、工程の印が数KB溜まるまで届かない
+                "-u",
                 "minimal_demo_mmgp.py",
                 "--input-image", input_path,
                 "--output", "/tmp/output",
@@ -94,19 +155,41 @@ def main() -> int:
                 "--profile", "3",
             ],
             cwd=REPO_DIR,
-            # 標準出力は素通しする。捕まえると親が全部メモリに溜め、
-            # ただでさえ余裕の無いメモリを圧迫する（実測でOOMの一因になった）。
-            # 標準エラーだけは失敗理由に使うので捕まえる。こちらは量が少ない
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,
         )
-        if result.returncode != 0:
-            if result.returncode == -9:
+
+        stderr_tail: collections.deque = collections.deque(maxlen=STDERR_KEEP_LINES)
+        stderr_reader = threading.Thread(
+            target=_drain_stderr, args=(process.stderr, stderr_tail), daemon=True
+        )
+        stderr_reader.start()
+
+        next_marker = 0
+        for line in process.stdout:
+            # まず素通し。Cloud Logging に出る内容は今までと変わらない
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if next_marker < len(PHASE_MARKERS):
+                marker, phase = PHASE_MARKERS[next_marker]
+                if marker in line:
+                    _set_phase(job_id, phase)
+                    next_marker += 1
+
+        process.stdout.close()
+        returncode = process.wait()
+        # 子が終わればパイプは閉じるので、読み手もすぐ抜ける。
+        # 万一抜けなければ待ち続けても仕方がないので打ち切る
+        stderr_reader.join(timeout=30)
+
+        if returncode != 0:
+            if returncode == -9:
                 # OOM による SIGKILL。この落ち方では stderr も残らない
                 raise RuntimeError("メモリ不足で強制終了された")
             # 最後の例外行だけを理由にする。全文は Cloud Logging にある
-            print(result.stderr, file=sys.stderr)
-            lines = [ln for ln in (result.stderr or "").strip().splitlines() if ln and not ln.startswith(" ")]
+            lines = [ln for ln in stderr_tail if ln and not ln.startswith(" ")]
             detail = lines[-1] if lines else "詳細はログを参照"
             raise RuntimeError(f"生成に失敗: {detail}")
 

@@ -210,6 +210,22 @@ def _reconcile_if_stale(status: dict) -> dict:
     return status
 
 
+def _elapsed_seconds(since: str | None) -> int:
+    """その時刻から何秒経ったか。
+
+    引き算を**サーバー側でやる**のが肝。時刻そのものを返して端末に引かせると、
+    端末の時計のずれがそのまま進捗のずれになる（数分ずれている端末は珍しくない）。
+    """
+    if not since:
+        return 0
+    try:
+        started = datetime.datetime.fromisoformat(since)
+    except ValueError:
+        return 0
+    delta = datetime.datetime.now(datetime.timezone.utc) - started
+    return max(0, int(delta.total_seconds()))
+
+
 def _signed_model_url(job_id: str) -> str:
     """成果物の署名付きURLを発行する。
 
@@ -610,6 +626,12 @@ def get_job(job_id: str, authorization: str | None = Header(default=None)):
         "state": status["state"],
         "createdAt": status["createdAt"],
     }
+    # いまの工程。ジョブ側が書けたときだけ入る。
+    # 書けていない場合でも state だけで画面は成立するので、必須にはしない
+    phase = status.get("phase")
+    if phase:
+        body["phase"] = phase
+        body["phaseElapsedSeconds"] = _elapsed_seconds(status.get("phaseStartedAt"))
     if status["state"] == "succeeded":
         body["modelUrl"] = _signed_model_url(job_id)
     if status.get("error"):
