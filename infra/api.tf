@@ -1,3 +1,13 @@
+# ワーカーが完了通知に使う ID トークンの aud。
+#
+# 本来は通知先の URL を使うが、Cloud Run のサービスは自分の URL を
+# Terraform から受け取れない（google_cloud_run_v2_service.api[0].uri を
+# 自分自身の env に入れると循環参照になる）。そこでワーカーと API で
+# 共有する固定の文字列にしてある。
+locals {
+  dispatch_audience = "https://hunyuan3d-dispatch/${var.project_id}"
+}
+
 # アプリから叩くAPI層。仕様は api/SPEC.md。
 #
 # GPU ジョブとは別の Cloud Run サービスにする。API層は薄くて速く、
@@ -113,6 +123,11 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "DISPATCHER_SERVICE_ACCOUNT"
         value = google_service_account.job.email
+      }
+
+      env {
+        name  = "DISPATCH_AUDIENCE"
+        value = local.dispatch_audience
       }
 
       env {

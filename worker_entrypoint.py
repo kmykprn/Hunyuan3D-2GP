@@ -34,6 +34,8 @@ from google.oauth2 import id_token
 REPO_DIR = "/app"
 OUTPUTS_BUCKET = os.environ["OUTPUTS_BUCKET"]
 API_URL = os.environ.get("API_URL", "").rstrip("/")
+# 完了通知に使う ID トークンの aud。API 側と同じ値でなければ 401 になる
+DISPATCH_AUDIENCE = os.environ.get("DISPATCH_AUDIENCE", "")
 
 _storage = storage.Client()
 _bucket = _storage.bucket(OUTPUTS_BUCKET)
@@ -66,10 +68,10 @@ def _update_status(job_id: str, **changes) -> None:
 
 def _notify_dispatcher() -> None:
     """完了を API に伝え、空いた GPU 枠で次の受付済み作成を始める。"""
-    if not API_URL:
+    if not API_URL or not DISPATCH_AUDIENCE:
         return
     try:
-        token = id_token.fetch_id_token(GoogleAuthRequest(), API_URL)
+        token = id_token.fetch_id_token(GoogleAuthRequest(), DISPATCH_AUDIENCE)
         request = Request(
             f"{API_URL}/internal/dispatch",
             data=b"",

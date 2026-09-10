@@ -48,6 +48,18 @@ GPU の同時実行数はプロジェクト全体で `max_running_jobs`（既定
 完了ワーカーが API へ通知して空き枠を回収し、次の待機ジョブを開始する。利用者が
 アプリを閉じていても待機列は進む。
 
+**待機列は `queue/pending/` の目印で引く。** `status.json` を全部読んで待機中を
+探すと、バケットに溜まったジョブの数だけ読み込みが増える。生成物は30日残るので
+月500件なら毎回500個読むことになり、ポーリングのたびに数秒かかる。目印なら
+**実際に待っている数**しか触らない。情報は全て名前に入れて中身は空にしてあり、
+数えるだけなら一覧するだけで済む。受付時刻を先頭に置くのは、名前順がそのまま
+受付順になるようにするため。
+
+**枠は状態を素直に信じずに回収する。** OOM の signal 9 ではワーカーが status を
+書けずに死ぬので、状態だけを見ていると `running` のまま枠が残る。枠は全体で
+`max_running_jobs` 本しかなく、塞がると誰も生成できないため、execution の死活まで
+確かめて解放する。目印の取り残しも、数えるついでに掃除する。
+
 ### `GET /jobs/{jobId}`
 
 ```
@@ -130,8 +142,8 @@ jobs/{jobId}/input.png       クライアントが上げた画像
 jobs/{jobId}/status.json     状態
 jobs/{jobId}/model.glb       成果物
 quota/{uid}/{YYYY-MM-DD}.json  当日の回数（count と attempts）
-quota/{uid}/queued.json      uid ごとの待機数
 queue/slots/{0..N}.json      プロジェクト全体の GPU 実行枠
+queue/pending/{uid}/{受付時刻}~{jobId}.json   待機中の目印（中身は空）
 ```
 
 **許可リストは別のバケット**（`...-hunyuan3d-config`）に置く。

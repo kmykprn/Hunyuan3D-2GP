@@ -169,6 +169,11 @@ resource "google_cloud_run_v2_job" "measure" {
           value = google_cloud_run_v2_service.api[0].uri
         }
 
+        env {
+          name  = "DISPATCH_AUDIENCE"
+          value = local.dispatch_audience
+        }
+
 
         volume_mounts {
           name       = "weights"

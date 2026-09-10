@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import traceback
 import uuid
 
 import firebase_admin
@@ -74,6 +75,11 @@ _allowlist_cache: tuple[datetime.datetime, set] | None = None
 SLOT_GRACE = datetime.timedelta(seconds=60)
 DISPATCH_CLAIM_TTL = datetime.timedelta(seconds=60)
 DISPATCHER_SERVICE_ACCOUNT = os.environ["DISPATCHER_SERVICE_ACCOUNT"]
+
+# ワーカーの完了通知に使う ID トークンの aud。Cloud Run の URL を使いたいところ
+# だが、サービスは自分の URL を Terraform から受け取れない（自己参照になる）ので、
+# ワーカーと API で共有する固定の文字列にしてある
+DISPATCH_AUDIENCE = os.environ["DISPATCH_AUDIENCE"]
 
 # ブラウザから叩けるようにする（curl では要らないので、実装当初は抜けていた）。
 # アプリは GitHub Pages、APIは Cloud Run と**別オリジン**なので、
@@ -312,50 +318,93 @@ def _slot_is_fresh(claimed_at: str | None, ttl: datetime.timedelta = SLOT_GRACE)
     return datetime.datetime.now(datetime.timezone.utc) - claimed < ttl
 
 
-def _queued_count_blob(uid: str):
-    return _bucket().blob(f"quota/{uid}/queued.json")
+# 待機中のジョブは、この目印を索引にして探す。
+#
+# status.json を全部読んで待機中を拾うと、バケットに溜まったジョブの数だけ
+# 読み込みが増える。生成物は30日残るので、月500件なら毎回500個読むことになり、
+# ポーリングのたびに数秒かかる。目印なら**実際に待っている数**しか見ない。
+#
+# 情報は全て名前に入れて中身は空にする。数えるだけなら一覧するだけで済み、
+# ダウンロードが要らない。受付時刻を先頭に置くのは、名前順がそのまま
+# 受付順になるようにするため。
+_PENDING_ROOT = "queue/pending/"
+_PENDING_SUFFIX = ".json"
 
 
-def _reserve_queue_space(uid: str) -> None:
-    """利用者ごとの待機上限を、GCS の CAS で超えないように確保する。"""
-    blob = _queued_count_blob(uid)
-    for _ in range(3):
-        data, generation = _read_slot(blob)
-        count = data.get("count", 0)
-        if count >= MAX_QUEUED_JOBS_PER_UID:
-            raise HTTPException(
-                status_code=429,
-                detail=f"同時に受け付けられる作成は{MAX_QUEUED_JOBS_PER_UID}件までです",
-            )
-        try:
-            blob.upload_from_string(
-                json.dumps({"count": count + 1}),
-                content_type="application/json",
-                if_generation_match=generation or 0,
-            )
-            return
-        except PreconditionFailed:
-            pass
-    raise HTTPException(status_code=409, detail="同時に処理されたので、やり直してほしい")
+def _pending_prefix(uid: str) -> str:
+    return f"{_PENDING_ROOT}{uid}/"
 
 
-def _release_queue_space(uid: str) -> None:
-    """開始済みまたは失敗したジョブの待機枠を返す。"""
-    blob = _queued_count_blob(uid)
-    for _ in range(3):
-        data, generation = _read_slot(blob)
-        count = data.get("count", 0)
-        if generation is None or count <= 0:
-            return
-        try:
-            blob.upload_from_string(
-                json.dumps({"count": count - 1}),
-                content_type="application/json",
-                if_generation_match=generation,
-            )
-            return
-        except PreconditionFailed:
-            pass
+def _pending_marker_blob(uid: str, created_at: str, job_id: str):
+    return _bucket().blob(f"{_pending_prefix(uid)}{created_at}~{job_id}{_PENDING_SUFFIX}")
+
+
+def _parse_pending_name(name: str) -> tuple[str, str, str] | None:
+    """目印の名前から uid・受付時刻・ジョブIDを取り出す。読めなければ None。"""
+    if not name.startswith(_PENDING_ROOT) or not name.endswith(_PENDING_SUFFIX):
+        return None
+    uid, _, tail = name[len(_PENDING_ROOT) : -len(_PENDING_SUFFIX)].partition("/")
+    created_at, separator, job_id = tail.rpartition("~")
+    if not uid or not separator or not job_id:
+        return None
+    return uid, created_at, job_id
+
+
+def _drop_pending_marker(blob) -> None:
+    """目印を消す。既に消えていても構わない。"""
+    try:
+        blob.delete()
+    except NotFound:
+        pass
+
+
+def _still_queued(job_id: str) -> dict | None:
+    """まだ起動を待っているジョブなら、その状態を返す。"""
+    status, generation = _read_slot(_status_blob(job_id))
+    if generation is None or status.get("state") != "queued" or status.get("executionName"):
+        return None
+    return status
+
+
+def _reserve_queue_space(uid: str, created_at: str, job_id: str) -> None:
+    """待機上限に収まることを確かめ、待機中の目印を置く。
+
+    数え上げなので、同時に投稿されると上限を1件超えることがある。それでも
+    GPU が余分に立つことはない。実行数を抑えているのは _claim_global_slot の
+    条件付き書き込みで、こちらは待機列を1人に占有させないための制限だから。
+
+    数えるついでに、起動済み・終了済みの取り残しを掃除する。これをしないと
+    通知の取りこぼし1回ごとに枠が減り、最後はその利用者が永久に 429 になる。
+    """
+    live = 0
+    for blob in _bucket().list_blobs(prefix=_pending_prefix(uid)):
+        parsed = _parse_pending_name(blob.name)
+        if not parsed:
+            continue
+        found_at, found_job_id = parsed[1], parsed[2]
+        # 目印は status.json より先に置くので、その隙間では状態を読めない。
+        # 取り立ての目印は生きているものとして扱う（掃除に消されないため）
+        if _still_queued(found_job_id) or _slot_is_fresh(found_at):
+            live += 1
+        else:
+            _drop_pending_marker(blob)
+
+    if live >= MAX_QUEUED_JOBS_PER_UID:
+        raise HTTPException(
+            status_code=429,
+            detail=f"同時に受け付けられる作成は{MAX_QUEUED_JOBS_PER_UID}件までです",
+        )
+
+    _pending_marker_blob(uid, created_at, job_id).upload_from_string(
+        "", content_type="application/json"
+    )
+
+
+def _release_queue_space(status: dict) -> None:
+    """起動済みまたは終了したジョブの目印を外す。"""
+    _drop_pending_marker(
+        _pending_marker_blob(status["uid"], status["createdAt"], status["jobId"])
+    )
 
 
 def _global_slot_blob(slot: int):
@@ -391,21 +440,31 @@ def _release_global_slot(slot: int, job_id: str) -> None:
 
 
 def _oldest_queued_job() -> dict | None:
-    """まだ起動していないジョブから、最も古いものを選ぶ。"""
-    candidates = []
-    for blob in _bucket().list_blobs(prefix="jobs/"):
-        if not blob.name.endswith("/status.json"):
-            continue
-        try:
-            status = json.loads(blob.download_as_text())
-        except ValueError:
-            continue
-        if status.get("state") != "queued" or status.get("executionName"):
+    """まだ起動していないジョブから、最も古いものを選ぶ。
+
+    目印の名前だけを一覧して受付順に見る。中身を読むのは先頭の候補だけなので、
+    溜まったジョブの数ではなく**実際に待っている数**しか触らない。
+    """
+    markers = []
+    for blob in _bucket().list_blobs(prefix=_PENDING_ROOT):
+        parsed = _parse_pending_name(blob.name)
+        if parsed:
+            markers.append((parsed[1], parsed[2], blob))
+    markers.sort(key=lambda marker: marker[0])
+
+    for created_at, job_id, blob in markers:
+        status = _still_queued(job_id)
+        if not status:
+            if _slot_is_fresh(created_at):
+                # status.json がまだ書かれていないだけ。次の機会に拾う
+                continue
+            # 起動済みか終了済みの取り残し。ここで掃除しておく
+            _drop_pending_marker(blob)
             continue
         if _slot_is_fresh(status.get("dispatchClaimedAt"), DISPATCH_CLAIM_TTL):
             continue
-        candidates.append(status)
-    return min(candidates, key=lambda status: status["createdAt"], default=None)
+        return status
+    return None
 
 
 def _claim_dispatch(job_id: str) -> dict | None:
@@ -466,22 +525,67 @@ def _record_execution(job_id: str, slot: int, execution_name: str) -> None:
             pass
 
 
+def _record_slot_execution(slot: int, job_id: str, execution_name: str) -> None:
+    """起動した execution を枠にも控える。
+
+    status.json はワーカーも書くので、_record_execution は競合で書けないことが
+    ある。そうなると execution 名がどこにも残らず、枠を回収する手掛かりが
+    無くなって GPU が1本減ったままになる。枠はディスパッチ側しか書かないので、
+    ここに控えておけば取りこぼしても後から死活を確かめられる。
+    """
+    blob = _global_slot_blob(slot)
+    data, generation = _read_slot(blob)
+    if generation is None or data.get("jobId") != job_id:
+        return
+    data["executionName"] = execution_name
+    try:
+        blob.upload_from_string(
+            json.dumps(data),
+            content_type="application/json",
+            if_generation_match=generation,
+        )
+    except PreconditionFailed:
+        pass
+
+
 def _release_finished_global_slots() -> None:
-    """正常終了・失敗済みジョブの枠を回収する。"""
+    """終了したジョブが握ったままの枠を回収する。
+
+    枠は全体で MAX_RUNNING_JOBS 本しかない。1本でも握られたままになると
+    その分だけ同時実行が減り、全部塞がると**誰も生成できなくなる**ので、
+    状態を素直に信じずに死活まで確かめる。
+
+    取りこぼす経路が2つある。
+      - OOM の signal 9 でワーカーが status を書けずに死ぬと running のまま残る
+      - 生成物バケットは30日で消えるので、古い枠は status ごと消えている
+    """
     for slot in range(MAX_RUNNING_JOBS):
         data, _ = _read_slot(_global_slot_blob(slot))
         job_id = data.get("jobId")
         if not job_id:
             continue
-        status, _ = _read_slot(_status_blob(job_id))
-        if status.get("state") in ("succeeded", "failed"):
+
+        status, generation = _read_slot(_status_blob(job_id))
+        if generation is None:
+            # status ごと無い。握らせ続ける理由がない
+            _release_global_slot(slot, job_id)
+            continue
+
+        # status.json への記録に失敗していたら、枠に控えた分で補う。
+        # これが無いと execution を照会できず、死活を判定できない
+        if not status.get("executionName") and data.get("executionName"):
+            status["executionName"] = data["executionName"]
+
+        # running のまま止まっているものは、ここで死活を見て failed に倒す
+        status = _reconcile_if_stale(status)
+        if status["state"] in ("succeeded", "failed"):
             _release_global_slot(slot, job_id)
 
 
 def _mark_start_failed(status: dict, slot: int, error: Exception) -> None:
     """Cloud Run Job を起動できなかった待機ジョブを終了扱いにする。"""
     _release_global_slot(slot, status["jobId"])
-    _release_queue_space(status["uid"])
+    _release_queue_space(status)
     _restore_quota(status["uid"])
     _write_status(
         status["jobId"],
@@ -494,10 +598,17 @@ def _mark_start_failed(status: dict, slot: int, error: Exception) -> None:
     )
 
 
+# 1リクエストで起動を試みる回数の上限。枠は MAX_RUNNING_JOBS 本しか無いので
+# 本来それで足りるが、起動に失敗した待機ジョブを畳む分だけ余裕を持たせる。
+# 上限を置くのは、1件の通知が延々と待機列を捌き続けてタイムアウトしないため。
+# 捌き残しは次の通知か次のポーリングで進む。
+MAX_DISPATCH_PER_REQUEST = MAX_RUNNING_JOBS + 5
+
+
 def _dispatch_queued_jobs() -> None:
     """空き GPU 枠を、古い待機ジョブから順に埋める。"""
     _release_finished_global_slots()
-    while True:
+    for _ in range(MAX_DISPATCH_PER_REQUEST):
         candidate = _oldest_queued_job()
         if not candidate:
             return
@@ -506,6 +617,7 @@ def _dispatch_queued_jobs() -> None:
             continue
         slot = _claim_global_slot(claimed["jobId"])
         if slot is None:
+            # 枠が全部埋まっている。予約を戻して、空いたときに拾わせる
             _clear_dispatch_claim(claimed["jobId"], claimed["dispatchClaimedAt"])
             return
         try:
@@ -513,8 +625,9 @@ def _dispatch_queued_jobs() -> None:
         except Exception as error:
             _mark_start_failed(claimed, slot, error)
             continue
+        _record_slot_execution(slot, claimed["jobId"], execution_name)
         _record_execution(claimed["jobId"], slot, execution_name)
-        _release_queue_space(claimed["uid"])
+        _release_queue_space(claimed)
 
 
 def _quota_blob(uid: str):
@@ -618,12 +731,19 @@ def _restore_quota_if_failed(status: dict) -> dict:
 
 
 def _check_dispatcher(authorization: str | None) -> None:
-    """完了通知は GPU ワーカーのサービスアカウントだけに限定する。"""
+    """完了通知は GPU ワーカーのサービスアカウントだけに限定する。
+
+    aud を照合するのは、そのサービスアカウントが**別の宛先に向けて**発行した
+    ID トークンを、ここに転用されないようにするため。audience を渡さないと
+    verify_oauth2_token は aud を検証しない。
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization ヘッダが無い")
     try:
         claims = id_token.verify_oauth2_token(
-            authorization[len("Bearer "):], google.auth.transport.requests.Request()
+            authorization[len("Bearer "):],
+            google.auth.transport.requests.Request(),
+            audience=DISPATCH_AUDIENCE,
         )
     except Exception:
         raise HTTPException(status_code=401, detail="ワーカー認証が無効")
@@ -707,13 +827,23 @@ async def create_job(
     png = _normalize_image(data)
 
     job_id = f"job_{uuid.uuid4().hex[:16]}"
+    now = _now()
+    status = {
+        "jobId": job_id,
+        "uid": uid,
+        "state": "queued",
+        "createdAt": now,
+        "updatedAt": now,
+        "executionName": None,
+        "error": None,
+    }
 
     # 正当な画像だけを待機列に受け付ける。1利用者が待機枠を独占しないよう、
-    # 待機上限も GCS の条件付き書き込みで確保する。
+    # 待機上限もここで確かめる。
     queue_reserved = False
     quota_consumed = False
     try:
-        _reserve_queue_space(uid)
+        _reserve_queue_space(uid, now, job_id)
         queue_reserved = True
         _consume_quota(uid)
         quota_consumed = True
@@ -721,30 +851,21 @@ async def create_job(
         _bucket().blob(f"jobs/{job_id}/input.png").upload_from_string(
             png, content_type="image/png"
         )
-
-        now = _now()
-        status = {
-            "jobId": job_id,
-            "uid": uid,
-            "state": "queued",
-            "createdAt": now,
-            "updatedAt": now,
-            "executionName": None,
-            "error": None,
-        }
         _write_status(job_id, status)
 
         # 空き GPU があればこのジョブを、なければ既存の先頭ジョブを起動する。
-        # 一時的なディスパッチ失敗では受付を取り消さず、次の通知で再試行する。
+        # 一時的なディスパッチ失敗で受付は取り消さない。待機のまま残るので
+        # 次の完了通知かポーリングで拾われる。ただし黙って捨てると、
+        # ずっと queued のまま進まなくなったときに手掛かりが無くなる
         try:
             _dispatch_queued_jobs()
         except Exception:
-            pass
+            traceback.print_exc()
     except Exception:
         if quota_consumed:
             _restore_quota(uid)
         if queue_reserved:
-            _release_queue_space(uid)
+            _release_queue_space(status)
         raise
 
     return {"jobId": job_id}
