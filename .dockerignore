@@ -1,0 +1,30 @@
+# イメージに入れる必要がないもの。
+# ビルドコンテキストが小さいほどビルドが速くなる。
+.git
+.gitignore
+
+# 計測の出力（CLOUDRUN_MEASURE.md 参照）
+measure_result.txt
+measure_*.log
+output/
+gradio_cache/
+
+# モデルの重みは実行時にマウントする。イメージには絶対に入れない（20GB）
+models/
+*.safetensors
+*.ckpt
+*.pth
+
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Terraform の作業ディレクトリ。ワーカーからは一切使わないうえ、
+# terraform.tfvars（請求先アカウントID）と .terraform のプロバイダ実体
+# （127MB）がそのままイメージに入ってしまう
+infra/
+
+# API層は別のイメージ（api/Dockerfile）でビルドする
+api/

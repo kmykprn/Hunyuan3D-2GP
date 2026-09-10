@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+google-cloud-storage
+google-auth
+python-multipart
+firebase-admin
+pillow
+# iPhone が既定で送る HEIC/HEIF を Pillow で開けるようにする
+pillow-heif
+
