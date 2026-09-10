@@ -67,7 +67,7 @@ Authorization: Bearer <Firebase ID トークン>
 
 → 200 {
     "state": "queued" | "running" | "succeeded" | "failed",
-    "createdAt": "2026-09-08T12:00:00Z",
+    "createdAt": "2026-09-08T12:00:00+00:00",
     "phase": "loading_texture_model",                   // 分かるときだけ
     "phaseElapsedSeconds": 42,                          // running のときだけ
     "modelUrl": "https://storage.googleapis.com/...",  // succeeded のみ、1時間有効
@@ -143,10 +143,15 @@ CORS が無いとブラウザはリクエストを1本も通さない。`curl` �
 ワイルドカードにはしない。
 
 ```
-https://kmykprn.github.io   GitHub Pages
-http://localhost:5173       ローカル開発（vite dev）
-capacitor://localhost       将来 iOS アプリにするとき
+https://kmykprn.github.io   GitHub Pages ← 既定はこれだけ
 ```
+
+**`localhost` は既定に入っていない。** ローカルから実APIを叩く必要が出た
+ときだけ `terraform.tfvars`（gitignore 済み）に足して apply し、用が済んだら
+戻す。tfvars に書けばリポジトリには残らないので、消し忘れても次の apply で
+既定に戻る。
+
+将来 iOS アプリにするときは `capacitor://localhost` を足す。
 
 `Authorization` ヘッダ付きの multipart なので、ブラウザは本番リクエストの前に
 **preflight（OPTIONS）** を投げる。許可ヘッダに `Authorization` と
@@ -206,13 +211,23 @@ API はこのバケットに読み取り権限しか持たず、書き込みは�
   "uid": "AbCdEf...",
   "state": "running",
   "phase": "loading_shape_model",
-  "phaseStartedAt": "2026-09-08T12:04:12Z",
-  "createdAt": "2026-09-08T12:00:00Z",
-  "updatedAt": "2026-09-08T12:04:31Z",
+  "phaseStartedAt": "2026-09-08T12:04:12+00:00",
+  "createdAt": "2026-09-08T12:00:00+00:00",
+  "updatedAt": "2026-09-08T12:04:31+00:00",
   "executionName": "projects/.../executions/hunyuan3d-job-x7k2m",
+  "slot": 0,
   "error": null
 }
 ```
+
+時刻は `+00:00` 付きの ISO8601。`Z` ではない。
+
+一時的にしか現れないキーもある。`dispatchClaimedAt` は起動を予約している間だけ、
+`quotaRestored` は失敗して回数を戻したあとに付く。
+
+**`executionName` と `slot` は API 層が書き、`phase` はジョブ側が書く。**
+書き手が2つあるので、どちらも読んでから条件付きで書き戻す
+（`if_generation_match`）。素の上書きにすると、相手が書いた項目を消す。
 
 ## 失敗の扱い ── ここは既存のバグを潰す箇所
 
@@ -286,12 +301,21 @@ API はこのバケットに読み取り権限しか持たず、書き込みは�
   - 同じ応答を2回取っても二重に戻らないこと（`quotaRestored`）
 - [ ] 成功したときは `count` が減らずに残ること
 - [ ] 失敗を繰り返すと `attempts` の上限で **429** になること
-- [ ] 409（実行中）と 400（画像が不正）は回数を消費しないこと
+- [ ] 409（同時更新）と 400（画像が不正）は回数を消費しないこと
 
-### 並行実行
+### 待機列
 
-- [ ] 同時に複数投げて、**GPU が1本しか起動しないこと**
-- [ ] 完了後は次を投げられること（枠が解放されている）
+- [ ] 同時に複数投げて、**GPU が `max_running_jobs` 本（既定2）までしか
+      起動しないこと**。溢れた分は `queued` で待つ
+- [ ] 先に投げたものから順に起動すること
+- [ ] 1本終わると、**利用者が何もしなくても**次の待機ジョブが始まること
+- [ ] 全部終わったあと `queue/slots/` と `queue/pending/` が空になっていること
+
+### 工程
+
+- [ ] `running` の間、`phase` が `preparing` から `finishing` まで
+      **順に進み、戻らないこと**
+- [ ] 完了後は `phaseElapsedSeconds` が返らないこと
 
 ### ブラウザから
 
