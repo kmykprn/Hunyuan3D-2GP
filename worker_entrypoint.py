@@ -27,11 +27,18 @@ import subprocess
 import sys
 import threading
 import traceback
+from urllib.request import Request, urlopen
 
+from google.api_core.exceptions import PreconditionFailed
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
+from google.oauth2 import id_token
 
 REPO_DIR = "/app"
 OUTPUTS_BUCKET = os.environ["OUTPUTS_BUCKET"]
+API_URL = os.environ.get("API_URL", "").rstrip("/")
+# 完了通知に使う ID トークンの aud。API 側と同じ値でなければ 401 になる
+DISPATCH_AUDIENCE = os.environ.get("DISPATCH_AUDIENCE", "")
 
 _storage = storage.Client()
 _bucket = _storage.bucket(OUTPUTS_BUCKET)
@@ -47,19 +54,41 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
+# status.json の書き込みを諦めるまでの回数。競合は API 層の書き込みと
+# 重なった一瞬だけなので、数回やり直せば必ず通る
+STATUS_WRITE_ATTEMPTS = 5
+
+
 def _update_status(job_id: str, **changes) -> None:
     """status.json を読んで変更を反映して書き戻す。
 
     API 層が書いた createdAt や uid を消さないよう、全体を上書きせず
     読んでからマージする。
+
+    **条件付き書き込みにするのは、書き手が2つあるため。** ジョブの起動直後、
+    API 層は executionName と slot を status に書く。こちらが素の上書きで
+    書き戻すと、読んでから書くまでの間に入ったその記録を消してしまう。
+    executionName が消えると、ジョブが応答しなくなったときに死活を
+    照会できず、GPU の実行枠を回収する判断ができなくなる。
     """
     blob = _bucket.blob(f"jobs/{job_id}/status.json")
-    status = json.loads(blob.download_as_text())
-    status.update(changes)
-    status["updatedAt"] = _now()
-    blob.upload_from_string(
-        json.dumps(status, ensure_ascii=False), content_type="application/json"
-    )
+    for _ in range(STATUS_WRITE_ATTEMPTS):
+        blob.reload()
+        generation = blob.generation
+        status = json.loads(blob.download_as_text())
+        status.update(changes)
+        status["updatedAt"] = _now()
+        try:
+            blob.upload_from_string(
+                json.dumps(status, ensure_ascii=False),
+                content_type="application/json",
+                if_generation_match=generation,
+            )
+            return
+        except PreconditionFailed:
+            # 読んでから書くまでの間に誰かが書いた。読み直してやり直す
+            pass
+    raise RuntimeError(f"status.json を更新できなかった: {job_id}")
 
 
 # 生成の工程。minimal_demo_mmgp.py が標準出力に出す印と、状態に書く名前の対。
@@ -111,6 +140,25 @@ def _drain_stderr(stream, keep: collections.deque) -> None:
         sys.stderr.write(line)
         keep.append(line.rstrip()[:STDERR_KEEP_CHARS])
     sys.stderr.flush()
+
+
+def _notify_dispatcher() -> None:
+    """完了を API に伝え、空いた GPU 枠で次の受付済み作成を始める。"""
+    if not API_URL or not DISPATCH_AUDIENCE:
+        return
+    try:
+        token = id_token.fetch_id_token(GoogleAuthRequest(), DISPATCH_AUDIENCE)
+        request = Request(
+            f"{API_URL}/internal/dispatch",
+            data=b"",
+            headers={"Authorization": f"Bearer {token}"},
+            method="POST",
+        )
+        with urlopen(request, timeout=30):
+            pass
+    except Exception:
+        # 通知に失敗しても生成結果は残す。次の API リクエストで再試行される。
+        traceback.print_exc()
 
 
 def main() -> int:
@@ -206,6 +254,7 @@ def main() -> int:
 
         _bucket.blob(f"jobs/{job_id}/model.glb").upload_from_filename(produced[0])
         _update_status(job_id, state="succeeded", error=None)
+        _notify_dispatcher()
         print(f"完了: {job_id}")
         return 0
 
@@ -215,6 +264,7 @@ def main() -> int:
             _update_status(job_id, state="failed", error=str(e)[:500])
         except Exception:
             traceback.print_exc()
+        _notify_dispatcher()
         return 1
 
 

@@ -20,3 +20,11 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# Terraform の作業ディレクトリ。ワーカーからは一切使わないうえ、
+# terraform.tfvars（請求先アカウントID）と .terraform のプロバイダ実体
+# （127MB）がそのままイメージに入ってしまう
+infra/
+
+# API層は別のイメージ（api/Dockerfile）でビルドする
+api/

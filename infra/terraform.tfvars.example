@@ -39,3 +39,8 @@ public_access = true
 #       --format='value(spec.template.spec.containers[0].image)'
 image     = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/hunyuan3d:v1"
 api_image = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/api:v1"
+
+# プロジェクト全体で同時にGPUを使う生成数と、uidごとの待機数。
+# L4の初期割り当ては3枚だが、既定は障害対応用に1枚の余白を残す。
+max_running_jobs        = 2
+max_queued_jobs_per_uid = 5
