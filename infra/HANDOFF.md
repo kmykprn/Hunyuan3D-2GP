@@ -193,23 +193,38 @@ billing_account = "<別途受け取ること>"
 region          = "asia-southeast1"
 budget_amount   = 5000
 operator_email  = "<自分のGoogleアカウント>"
+
+# ↓ ここから下を書き忘れると、既定値に落ちて本番が壊れる
+public_access   = true
+image           = "asia-southeast1-docker.pkg.dev/project-db31f07b-2895-48b8-8bb/hunyuan3d/hunyuan3d:v3"
+api_image       = "asia-southeast1-docker.pkg.dev/project-db31f07b-2895-48b8-8bb/hunyuan3d/api:v8"
 ```
 
 **請求先アカウントIDはここに書かない。** 安全な経路で受け取る。
 
 state は GCS にあるので、`terraform init` すれば同じ状態を参照できる。
 
+### ⚠️ `public_access` と イメージタグ を tfvars に書く理由
+
+`public_access` の既定は **`false`**、イメージの既定は **空文字**。
+つまり **tfvars に書かないまま `terraform apply` すると、
+`allUsers` が剥がれてSPAが全部落ち、動いているイメージも外れる。**
+
+これは「`allowed_origins` を1行直すだけ」のような無関係な変更でも起きる。
+`-var` で毎回渡す運用にすると、渡し忘れた回に事故る。**tfvars に書いて、
+素の `terraform apply` が常に正しくなる状態にしておくこと。**
+
 ## 適用する
 
 ```bash
-REPO=asia-southeast1-docker.pkg.dev/project-db31f07b-2895-48b8-8bb/hunyuan3d
-terraform apply \
-  -var="image=$REPO/hunyuan3d:v3" \
-  -var="api_image=$REPO/api:v7" \
-  -var="public_access=true"
+terraform apply
 ```
 
-`public_access=false` にすると入口が閉じ、運用者のアカウントだけが叩けるようになる。
+`plan` の差分が**自分が意図した分だけ**になっているか必ず見る。
+`api_invoker ... must be replaced` や `image -> null` が出ていたら、
+上の変数が tfvars に入っていない。
+
+入口を閉じて運用者だけに戻すときは `public_access = false` にする。
 
 ---
 

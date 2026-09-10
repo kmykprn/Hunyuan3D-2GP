@@ -28,7 +28,15 @@
 | `uniform_bucket_level_access` | 全バケットで有効（オブジェクト単位のACLが無効） |
 | 他人のジョブ | 署名付きURL発行**前**に所有者を検証し、404 |
 | `job_id` の形式 | 入口で検証 |
-| プロジェクトで有効なAPI | run / artifactregistry / storage / billing / iam / iamcredentials のみ |
+| Firestore | 未有効（API自体が無効） |
+| ウェブAPIキーで叩けるAPI | **identitytoolkit と securetoken の2つだけ**。他は弾かれる（`firebasestorage` が "Not Found." になることを確認） |
+
+> **プロジェクトで有効なAPIの数は、攻撃面の指標にならない。**
+> Firebase を追加した時点で 45 個まで増えている（BigQuery 系7つ、App Engine、
+> Pub/Sub、Dataplex など、こちらが要求していないものが大半）。
+> 減らす価値はあるが、**キーが漏れたときの防波堤は「有効APIの少なさ」ではなく
+> 上の「キーで叩けるAPI」の行のほう。** ここを2つに絞ってあるので、
+> 有効APIが何個あってもキー経由では到達できない。
 
 ## キーが漏れたら何が起きるか
 
@@ -36,43 +44,64 @@
 |---|---|
 | GPU を起動する | **✗** 許可リストで403 |
 | バケットのデータを読む | **✗** 公開権限なし |
-| **匿名アカウントを無制限に作る** | **✓** |
+| 匿名アカウントを作る | **△** 作れるが **100件/1時間**で頭打ち。30日以上未使用は自動削除 |
 | **API層に 401 / 403 の負荷をかける** | **✓**（CPUのみ・最大3インスタンスなので被害は限定的） |
-| ユーザー列挙・パスワードリセットのスパム | 有効なプロバイダ次第 |
-| 他の課金APIを叩く | キーの制限次第 |
+| ユーザー列挙・パスワードリセットのスパム | **✗** 匿名しか有効にしていないので、叩く先が無い |
+| 他の課金APIを叩く | **✗** キーを2つのAPIに制限済み |
 
 ## ⚠️ Firebase の設定は Terraform 管理外
 
 **リポジトリからは確認できない。** コンソールとAPIで設定されているため、
 以下はこのファイルを読んでも分からない。定期的に実機から確認すること。
 
-### 確認する5点
+### 定期的に確認すること
 
 ```bash
 P=project-db31f07b-2895-48b8-8bb
 
-# ① ② キーの制限（restrictions が空なら無制限）
+# キーの制限。restrictions が空なら「何でも叩ける」状態に戻っている
 gcloud services api-keys list --project=$P --format=json | python3 -m json.tool
 
-# ③ 有効な認証プロバイダ（匿名だけになっているか）
+# 認証プロバイダ（anonymous だけか）、サインアップのクォータ、匿名の自動削除。
+# この3つはすべてこの1本のレスポンスに入っている
 curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "X-Goog-User-Project: $P" \
   "https://identitytoolkit.googleapis.com/admin/v2/projects/$P/config" | python3 -m json.tool
 
-# ④ Firestore / Storage を使っていないなら空のはず
+# Firestore を使っていないなら、API自体が無効でエラーになるのが正常
 gcloud firestore databases list --project=$P
 
-# 有効なAPIが増えていないか
-gcloud services list --enabled --project=$P
+# バケットが公開されていないか（4つとも enforced であること）
+gcloud storage buckets list --project=$P --format='value(name)' \
+  | xargs -I{} gcloud storage buckets describe gs://{} \
+      --format='value(name,public_access_prevention)'
 ```
 
-### 入れておくべき設定
+`X-Goog-User-Project` を付けないと identitytoolkit の admin API は
+`SERVICE_DISABLED` を返すことがある。
 
-| # | 設定 | 効果 |
-|---|---|---|
-| 1 | **HTTPリファラー制限** を `kmykprn.github.io/*` に | casual な悪用を止める。**ただしブラウザ以外からは偽装できるので、門ではなく段差** |
-| 2 | **API制限** を Identity Toolkit と Token Service だけに | 他の課金APIへの流用を防ぐ |
-| 3 | **identitytoolkit のクォータを絞る** | アカウント量産の被害が上限で止まる。**既定は大きいので見落としやすい** |
-| 4 | 使っていない**認証プロバイダを無効化** | 匿名だけにすればパスワードリセットのスパムが原理的に起きない |
+### 入れてある設定
+
+| # | 設定 | 状態 | 効果 |
+|---|---|---|---|
+| 1 | **API制限**を Identity Toolkit と Token Service だけに | ✅ | 他の課金APIへの流用を防ぐ |
+| 2 | **サインアップのクォータ** | ✅ 100件/1時間 | アカウント量産の被害が上限で止まる。**既定は大きいので見落としやすい** |
+| 3 | 使っていない**認証プロバイダを無効化** | ✅ `anonymous` のみ | パスワードリセットのスパムが原理的に起きない |
+| 4 | **匿名ユーザーの自動削除** | ✅ `autodeleteAnonymousUsers` | 匿名ユーザーも MAU に数える（5万まで無料、超過は $0.0055/MAU）。放っておくと使い捨てアカウントが永久に積み上がる |
+
+### HTTPリファラー制限は、意図的に掛けていない
+
+`kmykprn.github.io/*` に絞る案はあったが、採らなかった。
+
+`Referer` は**禁止ヘッダー**で、JavaScript からは設定も上書きもできない。
+そのため他サイトに置かれた JS からの悪用は確かに止まる。**が、curl からは
+自由に偽装できる。** 本気の相手には何の意味もない。
+
+止まるのは「他人のサイトに埋め込まれた JS」だけで、それは元々 CORS で
+止まっている。**得るものが小さいわりに、本番オリジンを1つに固定する制約が
+残る**ので掛けていない。
+
+キー漏洩に対する実際の防波堤は、上の表の #1（到達範囲）と #2（量の上限）。
 
 ## localhost の扱い
 
