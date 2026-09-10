@@ -113,23 +113,67 @@ with mock.patch.object(w, "_update_status", side_effect=RuntimeError("書けな�
     except Exception as e:
         check("例外を外に出さない", False, str(e))
 
-# --- 5. 印が前から順に1つずつしか進まないこと ---------------------------
-print("\n[5] 工程の印")
+# --- 5. 工程の追跡 ------------------------------------------------------
+print("\n[5] 工程の追跡")
+BUCKET.store.clear(); BUCKET.seq = 0
+put(J, {"jobId": J, "state": "running"})
+
+def run_lines(lines):
+    """行を食わせて、書かれた工程を順に返す。"""
+    seen = []
+    with mock.patch.object(w, "_set_phase", side_effect=lambda _j, p: seen.append(p)):
+        t = w.PhaseTracker(J)
+        for ln in lines:
+            t.feed(ln)
+    return seen
+
 markers = [m for m, _ in w.PHASE_MARKERS]
+phases = [p for _, p in w.PHASE_MARKERS]
+
 check("印は5つ", len(w.PHASE_MARKERS) == 5, str(len(w.PHASE_MARKERS)))
-# ログに前の印がもう一度出ても巻き戻らないことを、走査ロジックで再現
-log = [markers[0], markers[1], markers[0], markers[2]]
-seen, nxt = [], 0
-for line in log:
-    if nxt < len(w.PHASE_MARKERS):
-        m, p = w.PHASE_MARKERS[nxt]
-        if m in line:
-            seen.append(p); nxt += 1
-# 3行目で1つ目の印が再び出るが、待っているのは3つ目なので何も起きない。
-# 4行目で3つ目が来て初めて進む
+check("全部順に来れば全部出る", run_lines(markers) == phases, str(run_lines(markers)))
+
+# 実機の出力そのまま。印は本文の一部として現れる
+real = [
+    "\n=== Loading texture generation model ===\n",
+    "Loading pipeline components...\n",
+    "\n=== Loading i23d model ===\n",
+    "Generating 3D model with texture...\n",
+    "2026-09-10 11:41:14,635 - hy3dgen.shapgen - INFO - ---Face Reduction takes 10.34 seconds ---\n",
+    "2026-09-10 11:42:31,191 - hy3dgen.shapgen - INFO - ---Texture Generation takes 76.55 seconds ---\n",
+    "\n\u2705 3D model with texture generated successfully!\n",
+]
+check("実機の行から5工程すべて拾える", run_lines(real) == phases, str(run_lines(real)))
+
+# 巻き戻らないこと
+back = [markers[0], markers[1], markers[0], markers[2]]
 check("同じ印が再出現しても巻き戻らない",
-      seen == ["loading_texture_model", "loading_shape_model", "generating_shape"], str(seen))
-check("工程は必ず前に進む", seen == [p for _, p in w.PHASE_MARKERS][:len(seen)], str(seen))
+      run_lines(back) == phases[:3], str(run_lines(back)))
+
+# ★実機で踏んだ事象: 途中の印が出なくても、その先で止まらないこと
+skipped = [markers[0], markers[1], markers[2], markers[4]]
+check("出ない印があっても後続で止まらない",
+      run_lines(skipped) == [phases[0], phases[1], phases[2], phases[4]],
+      str(run_lines(skipped)))
+
+# --- 6. 2スレッドから食わせても工程が重複しないこと ---------------------
+print("\n[6] 標準出力と標準エラーの同時投入")
+import threading as _th
+seen_mt = []
+lock = _th.Lock()
+def record(_j, p):
+    with lock: seen_mt.append(p)
+with mock.patch.object(w, "_set_phase", side_effect=record):
+    t = w.PhaseTracker(J)
+    def feeder():
+        for _ in range(50):
+            for m in markers: t.feed(m)
+    ts = [_th.Thread(target=feeder) for _ in range(4)]
+    for x in ts: x.start()
+    for x in ts: x.join()
+check("同じ工程が二度書かれない", len(seen_mt) == len(set(seen_mt)) == 5, str(seen_mt))
+check("順序が前向き", seen_mt == phases, str(seen_mt))
+
 
 print()
 print(f"{sum(results)}/{len(results)} 成功")

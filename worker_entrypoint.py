@@ -91,16 +91,23 @@ def _update_status(job_id: str, **changes) -> None:
     raise RuntimeError(f"status.json を更新できなかった: {job_id}")
 
 
-# 生成の工程。minimal_demo_mmgp.py が標準出力に出す印と、状態に書く名前の対。
+# 生成の工程。minimal_demo_mmgp.py が出す印と、状態に書く名前の対。
 #
-# **前から順に1つずつしか探さない。** 全行を全印と照合すると、ログに
-# たまたま同じ文字列が現れたときに工程が巻き戻る。生成は一本道なので、
-# 次に来るはずの印だけを待てばよい。
+# 印は標準出力と標準エラーに**またがる**。工程の区切りには print で
+# 標準出力に出るものと、logging で標準エラーに出るものが混在している。
+# どちらか片方だけを見ると、その工程が丸ごと落ちる。
 PHASE_MARKERS: tuple[tuple[str, str], ...] = (
     ("=== Loading texture generation model ===", "loading_texture_model"),
     ("=== Loading i23d model ===", "loading_shape_model"),
     ("Generating 3D model with texture...", "generating_shape"),
-    ("Generating texture...", "generating_texture"),
+    # 標準エラー側。--texture が通る generation_all() には
+    # テクスチャ開始を告げる print が無いので、面数削減の完了を知らせる
+    # このログを開始点として使う。
+    #
+    # print("Generating texture...") は存在するが、そちらは
+    # generate_3d_cli() の中、しかも generate_texture=True のときだけで、
+    # --texture の経路からは呼ばれない。実機で工程が止まって気付いた
+    ("---Face Reduction takes", "generating_texture"),
     ("3D model with texture generated successfully!", "finishing"),
 )
 
@@ -125,7 +132,40 @@ def _set_phase(job_id: str, phase: str) -> None:
         traceback.print_exc()
 
 
-def _drain_stderr(stream, keep: collections.deque) -> None:
+class PhaseTracker:
+    """行を食わせると、工程が進んだときだけ状態に書く。
+
+    **前にしか進まない。** 既に通り過ぎた印は見ないので、ログに同じ文字列が
+    再び現れても工程は巻き戻らない。
+
+    **残りの印を全部見る。** 次の1つだけを待つと、出ない印があったときに
+    そこで止まり、以降の工程が全部落ちる。実際 --texture の経路には
+    出ない印があり、テクスチャ生成も仕上げも表示されなくなっていた。
+
+    標準出力と標準エラーの2スレッドから食わせるので、位置は錠で守る。
+    """
+
+    def __init__(self, job_id: str) -> None:
+        self._job_id = job_id
+        self._index = 0
+        self._lock = threading.Lock()
+
+    def feed(self, line: str) -> None:
+        phase = None
+        with self._lock:
+            for offset in range(self._index, len(PHASE_MARKERS)):
+                marker, candidate = PHASE_MARKERS[offset]
+                if marker in line:
+                    self._index = offset + 1
+                    phase = candidate
+                    break
+        # 書き込みは錠の外でやる。GCS への往復を錠の中に入れると、
+        # その間もう一方のスレッドが読み進められなくなる
+        if phase:
+            _set_phase(self._job_id, phase)
+
+
+def _drain_stderr(stream, keep: collections.deque, phases: "PhaseTracker") -> None:
     """標準エラーを読み続け、素通ししつつ末尾だけ残す。
 
     別スレッドにするのは**デッドロックを避けるため**。標準出力を1行ずつ
@@ -139,6 +179,7 @@ def _drain_stderr(stream, keep: collections.deque) -> None:
     for line in stream:
         sys.stderr.write(line)
         keep.append(line.rstrip()[:STDERR_KEEP_CHARS])
+        phases.feed(line)
     sys.stderr.flush()
 
 
@@ -209,22 +250,18 @@ def main() -> int:
             bufsize=1,
         )
 
+        phases = PhaseTracker(job_id)
         stderr_tail: collections.deque = collections.deque(maxlen=STDERR_KEEP_LINES)
         stderr_reader = threading.Thread(
-            target=_drain_stderr, args=(process.stderr, stderr_tail), daemon=True
+            target=_drain_stderr, args=(process.stderr, stderr_tail, phases), daemon=True
         )
         stderr_reader.start()
 
-        next_marker = 0
         for line in process.stdout:
             # まず素通し。Cloud Logging に出る内容は今までと変わらない
             sys.stdout.write(line)
             sys.stdout.flush()
-            if next_marker < len(PHASE_MARKERS):
-                marker, phase = PHASE_MARKERS[next_marker]
-                if marker in line:
-                    _set_phase(job_id, phase)
-                    next_marker += 1
+            phases.feed(line)
 
         process.stdout.close()
         returncode = process.wait()
