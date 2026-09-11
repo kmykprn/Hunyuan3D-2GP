@@ -119,9 +119,13 @@ resource "google_cloud_run_v2_job" "measure" {
       }
 
       # 上の cache-dir が指す実体。Cloud Run にローカルディスクは無いので
-      # メモリ上に置くしかなく、その分はコンテナのメモリ上限(16GiB)に
-      # カウントされる。4GiB 使うと、アプリ側に残るのは約12GiB。
-      # 6GiB にしたときは OOM(signal 9)で落ちた
+      # メモリ上に置くしかなく、その分はコンテナのメモリ上限(job_memory)に
+      # カウントされる。ここで 4GiB を使う。
+      #
+      # 上限が 16GiB だった頃(4CPU構成)はアプリ側に約12GiBしか残らず、
+      # キャッシュを 6GiB にしたときは OOM(signal 9)で落ちた。
+      # 現在は 32GiB あり、実測ピークは 16.3GiB
+      # (キャッシュ4GiB＋アプリ約12GiB)で収まっている
       volumes {
         name = "cache"
         empty_dir {
@@ -156,8 +160,9 @@ resource "google_cloud_run_v2_job" "measure" {
         }
 
         # 生成物と状態の置き場。gcsfuse でマウントせず GCS API で読み書きする。
-        # マウントを2つにすると 16GiB を超えて OOM した（キャッシュが4GiBを
-        # 占めており、マウント1つ分の余裕しか無い）
+        # 上限が 16GiB だった頃、マウントを2つにすると超えて OOM した
+        # （キャッシュが4GiBを占めており、マウント1つ分の余裕しか無かった）。
+        # 32GiB にした今も、マウントを増やす理由が無いのでこのままにしてある
         env {
           name  = "OUTPUTS_BUCKET"
           value = google_storage_bucket.outputs.name
