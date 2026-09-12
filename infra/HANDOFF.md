@@ -79,7 +79,7 @@ KEY=<上記の方法で取得したウェブAPIキー>
 curl -s -X POST -H "Content-Type: application/json" -d '{"returnSecureToken":true}' \
   "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=$KEY"
 
-# 2. 返ってきた localId を許可リストに追加してもらう（次節）。しないと 403
+# 2. 返ってきた localId を許可リスト（uid の一覧）に追加してもらう（次節）。しないと 403
 
 # 3. 生成を投げる
 curl -H "Authorization: Bearer $ID_TOKEN" -F image=@photo.jpg "$API/jobs"
@@ -121,16 +121,23 @@ curl -s -X POST -d "grant_type=refresh_token&refresh_token=$RT" \
 L4 の割り当てはプロジェクト・リージョン単位なので、`max_running_jobs` は実際に付与された
 Cloud Run GPU クォータ以下にする。
 
-## 許可リストに uid を追加する
+## 許可リストに人を追加する
 
 GCS のファイルを1つ書き換えるだけ。**再デプロイは要らない**（60秒で反映）。
+一覧は 2 つあり、**どちらかに載っていれば通る**。
+
+- `allowed_uids.json` … 利用者ID（アプリの「利用者ID」に出る文字列）の配列。匿名のままの人はこちら
+- `allowed_emails.json` … Google ログインした人のメールアドレスの配列。**知り合いに配るときはこちら。**
+  相手に利用者IDを聞かなくてよい（大文字小文字は区別しない）
 
 ```bash
-B=gs://project-db31f07b-2895-48b8-8bb-hunyuan3d-config/config/allowed_uids.json
-gcloud storage cat $B > /tmp/a.json
-# ["既存のuid", "追加するuid"] の形にする
-gcloud storage cp /tmp/a.json $B
+C=gs://project-db31f07b-2895-48b8-8bb-hunyuan3d-config/config
+gcloud storage cat $C/allowed_emails.json > /tmp/e.json   # 無ければ [] から作る
+# ["friend@example.com", "another@example.com"] の形にする
+gcloud storage cp /tmp/e.json $C/allowed_emails.json
 ```
+
+uid の一覧も同じ要領（`allowed_uids.json`、`["既存のuid", "追加するuid"]`）。
 
 書き込みには GCS への権限が要る。
 

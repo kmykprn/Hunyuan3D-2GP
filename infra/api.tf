@@ -164,7 +164,7 @@ resource "google_cloud_run_v2_service" "api" {
 #
 # 開けても、アプリケーション側で二重に守っている。
 #   1. Firebase の ID トークンが無い・不正なら 401
-#   2. config/allowed_uids.json に載っていない uid は 403
+#   2. config/allowed_uids.json（uid）にも allowed_emails.json（メール）にも載っていなければ 403
 #
 # 2 が効いているので、トークン検証に穴があっても GPU は起動できない。
 # 許可リストは GCS に置いてあり、uid を足すたびの再デプロイは要らない。
