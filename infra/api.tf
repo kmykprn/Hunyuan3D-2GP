@@ -149,6 +149,18 @@ resource "google_cloud_run_v2_service" "api" {
     }
   }
 
+  # イメージは GitHub Actions が差し替える（deploy.tf）。Terraform はそこを見ない。
+  # 見ると、apply のたびに tfvars の古いイメージへ戻してしまう。
+  # var.api_image が効くのは最初にサービスを作るときだけ。
+  # client / client_version は gcloud が更新のたびに書き換えるので、それも差分にしない
+  lifecycle {
+    ignore_changes = [
+      template[0].containers[0].image,
+      client,
+      client_version,
+    ]
+  }
+
   depends_on = [google_project_service.required]
 }
 

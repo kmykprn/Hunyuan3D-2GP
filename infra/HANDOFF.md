@@ -232,7 +232,7 @@ operator_email  = "<自分のGoogleアカウント>"
 # ↓ ここから下を書き忘れると、既定値に落ちて本番が壊れる
 public_access   = true
 image           = "asia-southeast1-docker.pkg.dev/project-db31f07b-2895-48b8-8bb/hunyuan3d/hunyuan3d:v3"
-api_image       = "asia-southeast1-docker.pkg.dev/project-db31f07b-2895-48b8-8bb/hunyuan3d/api:v8"
+api_image       = "asia-southeast1-docker.pkg.dev/project-db31f07b-2895-48b8-8bb/hunyuan3d/api:v8"  # 最初に作るときだけ効く。以後は GitHub Actions が差し替える
 ```
 
 **請求先アカウントIDはここに書かない。** 安全な経路で受け取る。
@@ -254,6 +254,32 @@ state は GCS にあるので、`terraform init` すれば同じ状態を参照�
 ```bash
 terraform apply
 ```
+
+## API 層のデプロイ（GitHub Actions）
+
+`api/` の変更が main にマージされると、`.github/workflows/deploy-api.yml` が
+テストを通してからイメージを組んで push し、Cloud Run のサービスをそのイメージに更新する。
+**tfvars の `api_image` を上げ直す必要は無い**（`api.tf` はイメージの差分を見ない）。
+Actions タブの「Run workflow」で手でも動かせる。
+
+一度だけ要る準備（`infra/deploy.tf` が GitHub の入口を作る）:
+
+```bash
+terraform apply          # deploy.tf の分（Workload Identity 連携と hunyuan3d-deployer）が足される
+terraform output deploy_workload_identity_provider
+terraform output deploy_service_account
+```
+
+出た 2 つの値を GitHub リポジトリの Settings → Secrets and variables → Actions → **Variables** に入れる。
+
+| 変数名 | 値 |
+|---|---|
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/…/locations/global/workloadIdentityPools/github/providers/github` |
+| `GCP_DEPLOY_SERVICE_ACCOUNT` | `hunyuan3d-deployer@….iam.gserviceaccount.com` |
+
+鍵ファイルは作らない。GitHub が発行する短命のトークンを、このリポジトリのワークフローに限って
+サービスアカウントに引き換える。デプロイ用のサービスアカウントが持つのは
+「イメージを置く」「サービスを更新する」「API 層の SA として動かす」の 3 つだけ。
 
 `plan` の差分が**自分が意図した分だけ**になっているか必ず見る。
 `api_invoker ... must be replaced` や `image -> null` が出ていたら、
