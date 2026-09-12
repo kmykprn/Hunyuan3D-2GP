@@ -59,14 +59,22 @@ DAILY_ATTEMPT_LIMIT = int(os.environ.get("DAILY_ATTEMPT_LIMIT", "20"))
 MAX_RUNNING_JOBS = int(os.environ.get("MAX_RUNNING_JOBS", "2"))
 MAX_QUEUED_JOBS_PER_UID = int(os.environ.get("MAX_QUEUED_JOBS_PER_UID", "5"))
 
-# 許可リストは GCS に置く。uid を足すたびに再デプロイしないため。
+# 許可リストは GCS に置く。人を足すたびに再デプロイしないため。
 # 毎リクエスト読むと待ち時間が延びるので短時間だけ覚えておく
 # 生成物バケットとは別のバケットに置く。API はこちらに読み取り権限しか持たない。
 # 同居させると、門番を門番自身が書き換えられる状態になる
+#
+# 一覧は 2 つ。どちらかに載っていれば通す。
+#   uids   … 利用者ID。匿名のままの人はこちらでしか通せない
+#   emails … Google に紐づけた人のメールアドレス。相手に利用者IDを聞かずに、
+#            こちらが知っているメールを先に書いておける（知り合いに配るとき用）
 CONFIG_BUCKET = os.environ["CONFIG_BUCKET"]
-ALLOWLIST_PATH = "config/allowed_uids.json"
+ALLOWLIST_PATHS = {
+    "uids": "config/allowed_uids.json",
+    "emails": "config/allowed_emails.json",
+}
 ALLOWLIST_TTL = datetime.timedelta(seconds=60)
-_allowlist_cache: tuple[datetime.datetime, set] | None = None
+_allowlist_cache: dict[str, tuple[datetime.datetime, set]] = {}
 
 # 枠を取った直後は status.json がまだ無い。その隙に別のリクエストが
 # 「もう終わっている」と誤判定して枠を奪えてしまうため、取り立ての枠は
@@ -280,31 +288,48 @@ def _signed_model_url(job_id: str) -> str:
 # Google Frontend が /healthz を横取りし、アプリに到達する前に
 # HTML の404を返す（アプリ側で登録しても届かない）。
 # SPEC.md は /healthz と書いているが、この環境では実現できない。
-def _uid_from_token(authorization: str | None) -> str:
-    """Authorization ヘッダの Firebase ID トークンを検証して uid を返す。"""
+def _identity_from_token(authorization: str | None) -> tuple[str, str | None]:
+    """Authorization ヘッダの Firebase ID トークンを検証して、uid とメールアドレスを返す。
+
+    メールは Google が確認済み（email_verified）のものだけ。匿名アカウントには無いので None。
+    小文字にそろえて返す（許可リストと突き合わせるため）
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization ヘッダが無い")
     try:
         decoded = fb_auth.verify_id_token(authorization[len("Bearer "):])
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"トークンが無効: {e}")
-    return decoded["uid"]
+    email = decoded.get("email") if decoded.get("email_verified") else None
+    return decoded["uid"], (email.lower() if email else None)
 
 
-def _allowed_uids() -> set:
-    global _allowlist_cache
+def _uid_from_token(authorization: str | None) -> str:
+    return _identity_from_token(authorization)[0]
+
+
+def _allowlist(kind: str) -> set:
+    """許可リストを読む。無ければ空（＝誰も通さない）。メールは小文字にそろえる"""
     now = datetime.datetime.now(datetime.timezone.utc)
-    if _allowlist_cache and now - _allowlist_cache[0] < ALLOWLIST_TTL:
-        return _allowlist_cache[1]
-    blob = _storage.bucket(CONFIG_BUCKET).blob(ALLOWLIST_PATH)
-    uids = set(json.loads(blob.download_as_text())) if blob.exists() else set()
-    _allowlist_cache = (now, uids)
-    return uids
+    cached = _allowlist_cache.get(kind)
+    if cached and now - cached[0] < ALLOWLIST_TTL:
+        return cached[1]
+    blob = _storage.bucket(CONFIG_BUCKET).blob(ALLOWLIST_PATHS[kind])
+    entries = json.loads(blob.download_as_text()) if blob.exists() else []
+    values = {str(v).lower() if kind == "emails" else str(v) for v in entries}
+    _allowlist_cache[kind] = (now, values)
+    return values
 
 
-def _check_allowed(uid: str) -> None:
-    if ENFORCE_ALLOWLIST and uid not in _allowed_uids():
-        raise HTTPException(status_code=403, detail="このアカウントはまだ利用できない")
+def _check_allowed(uid: str, email: str | None = None) -> None:
+    """uid かメールのどちらかが許可リストに載っていれば通す。"""
+    if not ENFORCE_ALLOWLIST:
+        return
+    if uid in _allowlist("uids"):
+        return
+    if email and email in _allowlist("emails"):
+        return
+    raise HTTPException(status_code=403, detail="このアカウントはまだ利用できない")
 
 
 def _read_slot(blob) -> tuple[dict, int | None]:
@@ -826,8 +851,8 @@ def _normalize_image(data: bytes) -> bytes:
 async def create_job(
     image: UploadFile = File(...), authorization: str | None = Header(default=None)
 ):
-    uid = _uid_from_token(authorization)
-    _check_allowed(uid)
+    uid, email = _identity_from_token(authorization)
+    _check_allowed(uid, email)
 
     data = await image.read()
     if not data:

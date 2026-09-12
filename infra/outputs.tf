@@ -16,6 +16,6 @@ output "run_job_command" {
 }
 
 output "allowlist_path" {
-  description = "許可リストの置き場。uid を足すときはここを書き換える（再デプロイ不要）"
+  description = "許可リストの置き場。uid を足すときはここを書き換える（再デプロイ不要）。同じ場所の allowed_emails.json にメールを書いてもよい"
   value       = "gs://${google_storage_bucket.config.name}/config/allowed_uids.json"
 }
