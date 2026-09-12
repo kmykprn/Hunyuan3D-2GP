@@ -64,6 +64,8 @@ resource "google_project_service" "required" {
     # API層が署名付きURLを発行するのに要る。Cloud Run のサービスアカウントは
     # 秘密鍵を持たないので、SignBlob API に署名を代行させる
     "iamcredentials.googleapis.com",
+    # GitHub Actions が Workload Identity 連携でトークンを引き換えるのに要る（deploy.tf）
+    "sts.googleapis.com",
   ])
 
   service            = each.value

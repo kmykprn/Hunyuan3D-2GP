@@ -39,9 +39,15 @@ variable "job_timeout_seconds" {
 }
 
 variable "api_image" {
-  description = "API層のコンテナイメージ。push 前は空にしておき、サービスを作らせない"
+  description = "API層のコンテナイメージ。push 前は空にしておき、サービスを作らせない。作ったあとの差し替えは GitHub Actions が行う（deploy.tf）ので、ここを上げ直す必要は無い"
   type        = string
   default     = ""
+}
+
+variable "github_repository" {
+  description = "API 層をデプロイしてよい GitHub リポジトリ（owner/name）。このリポジトリのワークフローだけが GCP に入れる"
+  type        = string
+  default     = "kmykprn/Hunyuan3D-2GP"
 }
 
 variable "operator_email" {

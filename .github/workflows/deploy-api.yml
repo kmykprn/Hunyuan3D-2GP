@@ -1,0 +1,91 @@
+# API 層（api/）を Cloud Run にデプロイする。
+#
+# main に api/ の変更が入ったら動く。手で動かすこともできる（Actions タブの Run workflow）。
+# GCP へは Workload Identity 連携で入る（鍵ファイルは無い。infra/deploy.tf）。
+#
+# 先にテストを通し、通ったものだけを組んで push し、サービスを更新する。
+# 一度に動くデプロイは 1 つ。続けてマージしても後の方だけが残るようにする。
+
+name: Deploy API
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - '.github/workflows/deploy-api.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: project-db31f07b-2895-48b8-8bb
+  REGION: asia-southeast1
+  SERVICE: hunyuan3d-api
+  IMAGE_REPOSITORY: asia-southeast1-docker.pkg.dev/project-db31f07b-2895-48b8-8bb/hunyuan3d
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: api/requirements.txt
+      - run: pip install -r api/requirements.txt
+      - name: 待機列と許可リストのテスト
+        working-directory: api
+        run: |
+          python test_queue.py
+          python test_allowlist.py
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    # GitHub が GCP 向けの OIDC トークンを発行するのに要る
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GCP に入る（Workload Identity 連携）
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Artifact Registry に docker で push できるようにする
+        run: gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+      # タグはコミットの短い SHA。どのコードが動いているかを Cloud Run のコンソールから辿れる
+      - name: イメージを組んで push
+        id: image
+        run: |
+          IMAGE="${IMAGE_REPOSITORY}/api:sha-${GITHUB_SHA::7}"
+          docker build -t "$IMAGE" api
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # 環境変数やスケール設定は Terraform が持っている。ここではイメージだけ差し替える
+      - name: Cloud Run のサービスを更新
+        run: |
+          gcloud run services update "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --image "${{ steps.image.outputs.image }}" \
+            --quiet
+
+      - name: 新しいリビジョンが応答するか
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')
+          # 認証無しの /jobs は 401 が正しい。5xx や接続失敗なら起動に失敗している
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/jobs")
+          echo "POST /jobs (no auth) -> $CODE"
+          test "$CODE" = "401"
