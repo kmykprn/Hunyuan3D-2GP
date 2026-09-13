@@ -85,7 +85,8 @@ jobs:
       - name: 新しいリビジョンが応答するか
         run: |
           URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')
-          # 認証無しの /jobs は 401 が正しい。5xx や接続失敗なら起動に失敗している
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL/jobs")
-          echo "POST /jobs (no auth) -> $CODE"
+          # 認証無しの GET /jobs/{id} は 401 が正しい。5xx や接続失敗なら起動に失敗している。
+          # POST /jobs は本文（画像）が必須で、無いと FastAPI が認証より先に 422 で返すので使えない
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL/jobs/job_0000000000000000")
+          echo "GET /jobs/{id} (no auth) -> $CODE"
           test "$CODE" = "401"
