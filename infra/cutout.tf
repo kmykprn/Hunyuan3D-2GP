@@ -38,6 +38,12 @@ resource "google_storage_bucket_iam_member" "cutout_rw_state" {
   member = "serviceAccount:${google_service_account.cutout.email}"
 }
 
+# 推論に使う CPU 数。resources と INFERENCE_THREADS の両方に同じ値を入れる。
+# コンテナの中で os.cpu_count() を見るとホストの CPU 数が返るので、ここから渡す
+locals {
+  cutout_cpu = 4
+}
+
 resource "google_cloud_run_v2_service" "cutout" {
   count = var.cutout_image == "" ? 0 : 1
 
@@ -76,11 +82,15 @@ resource "google_cloud_run_v2_service" "cutout" {
         name  = "ALLOWED_ORIGINS"
         value = join(",", var.allowed_origins)
       }
+      env {
+        name  = "INFERENCE_THREADS"
+        value = tostring(local.cutout_cpu)
+      }
 
       resources {
         limits = {
           # 4 vCPU で 1 枚 5 秒、2 vCPU なら 8 秒。費用は同じ（vCPU × 秒）なので速いほうを取る
-          cpu = "4"
+          cpu = tostring(local.cutout_cpu)
           # 実測のピーク 6.4GB に、Python 本体と読み込み中の画像ぶんの余裕を足す
           memory = "12Gi"
         }
