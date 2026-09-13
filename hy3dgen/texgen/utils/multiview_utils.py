@@ -76,5 +76,6 @@ class Multiview_Diffusion_Net():
         kwargs["normal_imgs"] = normal_image
         kwargs["position_imgs"] = position_image
 
-        mvd_image = self.pipeline(input_image, num_inference_steps=30, **kwargs).images
+        # 拡散のステップ数。既定 30。TEXTURE_STEPS で下げて所要時間と品質を測れる
+        mvd_image = self.pipeline(input_image, num_inference_steps=int(os.environ.get('TEXTURE_STEPS', '30')), **kwargs).images
         return mvd_image

@@ -14,6 +14,7 @@
 
 import cv2
 import numpy as np
+import os
 import torch
 from PIL import Image
 from diffusers import StableDiffusionInstructPix2PixPipeline, EulerAncestralDiscreteScheduler
@@ -94,7 +95,7 @@ class Light_Shadow_Remover():
             generator=torch.manual_seed(42),
             height=512,
             width=512,
-            num_inference_steps=50,
+            num_inference_steps=int(os.environ.get('DELIGHT_STEPS', '50')),
             image_guidance_scale=self.cfg_image,
             guidance_scale=self.cfg_text,
         ).images[0]
