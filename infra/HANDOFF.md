@@ -287,6 +287,25 @@ terraform output deploy_service_account
 
 入口を閉じて運用者だけに戻すときは `public_access = false` にする。
 
+## 切り抜きサービス（cutout/）
+
+写真から家具だけを切り抜いて透過 PNG を返す。仕様は `cutout/SPEC.md`。
+3D 生成とは別の Cloud Run サービス `cutout`（4 vCPU / 12Gi、同時実行 1、最大 2 台）。
+Google ログイン済みのアカウントだけが叩け、許可リストは見ない。1 人 1 日 50 枚（`cutout_daily_limit`）。
+
+デプロイは API 層と同じ流れ。`cutout/` の変更が main に入ると `.github/workflows/deploy-cutout.yml` が
+テスト → イメージ → `gcloud run services update` を行う。GitHub の Variables は API 層と共通。
+
+最初の 1 回だけは手でイメージを置いてから apply する（サービスは `cutout_image` が空だと作られない）:
+
+```bash
+docker build -t $(terraform output -raw image_repository)/cutout:v1 ../cutout
+docker push $(terraform output -raw image_repository)/cutout:v1
+# terraform.tfvars に cutout_image = "…/cutout:v1" を書いて
+terraform apply
+terraform output cutout_url     # roomplanner-web の config/api.ts に書く
+```
+
 ---
 
 # いまクラウド上にあるもの
