@@ -26,9 +26,17 @@ Cloud Tasks も使わない。Cloud Run Jobs の実行API自体がキューの�
 Authorization: Bearer <Firebase ID トークン>
 Content-Type: multipart/form-data
   image: JPEG または PNG（5MBまで）
+  kind:  "model"（既定）または "views"
 
 → 202 { "jobId": "job_7f3a2b..." }
 ```
+
+`kind` で何を作るかを選ぶ。どちらも同じ GPU ワーカー・同じ待機列・同じ回数制限。
+
+| kind | 作るもの | 所要 | 入力 |
+|---|---|---|---|
+| `model` | 3D モデル（GLB） | 約 9 分 | 写真 |
+| `views` | 45° 刻み 8 方向の画像（PNG × 8） | 約 3 分 | 切り抜き（透過 PNG）。向きを変えて置くためのもの |
 
 | 状態 | 意味 |
 |---|---|
@@ -70,7 +78,10 @@ Authorization: Bearer <Firebase ID トークン>
     "createdAt": "2026-09-08T12:00:00+00:00",
     "phase": "loading_texture_model",                   // 分かるときだけ
     "phaseElapsedSeconds": 42,                          // running のときだけ
-    "modelUrl": "https://storage.googleapis.com/...",  // succeeded のみ、1時間有効
+    "kind": "model" | "views",
+    "modelUrl": "https://storage.googleapis.com/...",  // kind=model の succeeded のみ、1時間有効
+    "viewUrls": { "0": "https://...", "45": "https://...", ... "315": "https://..." },
+                                                        // kind=views の succeeded のみ、1時間有効
     "error": "..."                                      // failed のみ
   }
 ```
@@ -91,6 +102,9 @@ Authorization: Bearer <Firebase ID トークン>
 | `generating_shape` | 形を作る（面数削減を含む） | 30〜90秒 |
 | `generating_texture` | 色をつける | 80〜170秒 |
 | `finishing` | 成果物の保存とアップロード | 数秒 |
+| `loading_views_model` | （kind=views）多視点モデルの読み込み。重み 10GB の写しを含む | 約120秒 |
+| `generating_views` | （kind=views）8 方向の画像を作る | 約60秒 |
+| `cutting_views` | （kind=views）8 枚の背景を抜いて共通の範囲で切り詰める（CPU） | 約40秒 |
 
 秒数は目安で、画像によって倍近く変わる。**進捗バーの目盛りには使えるが、
 残り時間の約束には使えない。**

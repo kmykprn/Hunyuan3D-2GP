@@ -25,7 +25,7 @@ RUN mkdir -p /models \
     && curl -fsSL "$MODEL_URL" -o /models/birefnet-general-lite.onnx \
     && echo "$MODEL_MD5  /models/birefnet-general-lite.onnx" | md5sum -c -
 
-COPY main.py .
+COPY main.py birefnet.py .
 
 # Cloud Run は $PORT で待ち受けることを要求する
 ENV PORT=8080

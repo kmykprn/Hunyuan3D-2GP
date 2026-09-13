@@ -75,6 +75,17 @@ RUN grep -v '^diso$' requirements.txt > /tmp/req.txt \
 # requirements.txt には無い（生成そのものには不要なため）
 RUN pip install google-cloud-storage
 
+# 8 方向の画像（multiview.py）の背景を抜く BiRefNet（MIT）。切り抜きサービスと同じ配布物。
+# onnxruntime は CPU 版。GPU は拡散モデルが使い切っているので、こちらは 8 CPU で回す
+RUN pip install onnxruntime
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG BIREFNET_URL=https://github.com/danielgatis/rembg/releases/download/v0.0.0/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx
+ARG BIREFNET_MD5=4fab47adc4ff364be1713e97b7e66334
+RUN mkdir -p /opt/birefnet \
+    && curl -fsSL "$BIREFNET_URL" -o /opt/birefnet/birefnet-general-lite.onnx \
+    && echo "$BIREFNET_MD5  /opt/birefnet/birefnet-general-lite.onnx" | md5sum -c -
+
 # 拡張のソースだけ先に入れてビルドする。
 # こうしておくと、アプリのコードを直してもこの重い層が再利用される
 COPY hy3dgen/texgen/custom_rasterizer       hy3dgen/texgen/custom_rasterizer
@@ -109,6 +120,8 @@ RUN ln -sf /usr/bin/python3.10 /usr/bin/python
 # builder の成果物はこの1本だけ。CUDAツールキットもコンパイラも持ってこない
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
+# 背景を抜くモデル（224MB）。3D 生成では使わない
+COPY --from=builder /opt/birefnet /opt/birefnet
 
 WORKDIR /app
 COPY . .

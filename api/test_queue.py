@@ -186,7 +186,7 @@ for n in range(3):
     main._pending_marker_blob("uidA", c, jid).upload_from_string("")
 
 started = []
-def fake_start(job_id, slot):
+def fake_start(job_id, slot, kind="model"):
     started.append((job_id, slot)); return f"exec-{job_id}"
 
 with mock.patch.object(main, "_start_job", side_effect=fake_start):
@@ -260,3 +260,27 @@ print()
 bad = [n for n, ok, _ in results if not ok]
 print(f"{len(results)-len(bad)}/{len(results)} 成功")
 sys.exit(1 if bad else 0)
+
+
+# --- 9. ジョブの種類 ----------------------------------------------------
+print("\n[9] ジョブの種類（model / views）")
+reset()
+check("種類は 2 つ", main.JOB_KINDS == ("model", "views"), str(main.JOB_KINDS))
+check("8 方向は 45° 刻み", main.VIEW_AZIMUTHS == (0, 45, 90, 135, 180, 225, 270, 315), str(main.VIEW_AZIMUTHS))
+with mock.patch.object(main, "_signed_url", side_effect=lambda path: f"signed:{path}"):
+    urls = main._signed_view_urls("job_0000000000000001")
+check("8 方向ぶんの署名付きURLが方位角をキーに並ぶ",
+      set(urls) == {"0", "45", "90", "135", "180", "225", "270", "315"} and urls["45"].endswith("/views/045.png"), str(urls))
+# 起動時に種類が環境変数で渡る
+captured = {}
+class FakeRes:
+    def raise_for_status(self): pass
+    def json(self): return {"metadata": {"name": "exec-1"}}
+def fake_post(url, json=None, timeout=None):
+    captured["env"] = json["overrides"]["containerOverrides"][0]["env"]; return FakeRes()
+with mock.patch.object(main._session, "post", side_effect=fake_post):
+    main._start_job("job_0000000000000001", 0, "views")
+check("起動時に JOB_KIND=views が渡る", {"name": "JOB_KIND", "value": "views"} in captured["env"], str(captured))
+with mock.patch.object(main._session, "post", side_effect=fake_post):
+    main._start_job("job_0000000000000001", 0)
+check("種類を省けば model", {"name": "JOB_KIND", "value": "model"} in captured["env"], str(captured))

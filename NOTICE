@@ -212,3 +212,8 @@ https://huggingface.co/Tencent-Hunyuan/HunyuanDiT/blob/main/Notice
 --------------------------------------------------------------------
 
 This Model also incorporates insights from Flux's neural network architechtures (https://github.com/black-forest-labs/flux?tab=readme-ov-file). Credits are given to the orginal authors.
+--------------------------------------------------------------------------------
+mvadapter/ は MV-Adapter（https://github.com/huanngzh/MV-Adapter, Apache License 2.0）から、
+多視点画像の生成に要る部分だけを写したもの。ライセンス全文は mvadapter/LICENSE にある。
+使う重み（mvadapter_i2mv_sdxl.safetensors）も同じ Apache License 2.0。
+土台の Stable Diffusion XL は CreativeML Open RAIL++-M License。
