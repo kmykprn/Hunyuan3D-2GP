@@ -1,0 +1,85 @@
+# 切り抜きサービス（cutout/）を Cloud Run にデプロイする。deploy-api.yml と同じ作り。
+#
+# main に cutout/ の変更が入ったら動く。手で動かすこともできる（Actions タブの Run workflow）。
+# GCP へは Workload Identity 連携で入る（鍵ファイルは無い。infra/deploy.tf）。
+
+name: Deploy cutout
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cutout/**'
+      - '.github/workflows/deploy-cutout.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cutout
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: project-db31f07b-2895-48b8-8bb
+  REGION: asia-southeast1
+  SERVICE: cutout
+  IMAGE_REPOSITORY: asia-southeast1-docker.pkg.dev/project-db31f07b-2895-48b8-8bb/hunyuan3d
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: cutout/requirements.txt
+      - run: pip install -r cutout/requirements.txt httpx
+      - name: 認証・回数・画像の検証のテスト（モデルは読まない）
+        working-directory: cutout
+        run: python test_cutout.py
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GCP に入る（Workload Identity 連携）
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Artifact Registry に docker で push できるようにする
+        run: gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+      - name: イメージを組んで push
+        id: image
+        run: |
+          IMAGE="${IMAGE_REPOSITORY}/cutout:sha-${GITHUB_SHA::7}"
+          docker build -t "$IMAGE" cutout
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # 環境変数やメモリの設定は Terraform が持っている。ここではイメージだけ差し替える
+      - name: Cloud Run のサービスを更新
+        run: |
+          gcloud run services update "$SERVICE" \
+            --project "$PROJECT_ID" \
+            --region "$REGION" \
+            --image "${{ steps.image.outputs.image }}" \
+            --quiet
+
+      - name: 新しいリビジョンが応答するか
+        run: |
+          URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')
+          # 認証無しの POST /cutouts は 401 が正しい（画像を付けて本文の検証を通す）。
+          # 5xx や接続失敗なら起動に失敗している
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -F "image=@README.md" "$URL/cutouts")
+          echo "POST /cutouts (no auth) -> $CODE"
+          test "$CODE" = "401"

@@ -169,3 +169,15 @@ variable "public_access" {
   type        = bool
   default     = false
 }
+
+variable "cutout_image" {
+  description = "切り抜きサービスのコンテナイメージ。push 前は空にしておき、サービスを作らせない。作ったあとの差し替えは GitHub Actions が行う（deploy-cutout.yml）"
+  type        = string
+  default     = ""
+}
+
+variable "cutout_daily_limit" {
+  description = "切り抜きの 1 人あたり 1 日の上限。1 枚 0.1 円程度なので費用の歯止めではなく、叩き放題にしないため"
+  type        = number
+  default     = 50
+}
