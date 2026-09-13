@@ -95,6 +95,14 @@ resource "google_cloud_run_v2_job" "measure" {
           name  = "WEIGHTS_PREFIX"
           value = "hub-fp16"
         }
+        # rembg が依存する pymatting は import 時に numba で JIT コンパイルし、コンテナを
+        # 立てるたびに 23 秒かかっていた（実測。他の import は合計 3 秒）。JIT を切ると 0.5 秒。
+        # コンパイルされる関数はアルファマッティング用で、この生成では使わない。
+        # 3D 生成のコードは numba を使っていないので、切っても速さは変わらない
+        env {
+          name  = "NUMBA_DISABLE_JIT"
+          value = "1"
+        }
 
         # trust_remote_code でカスタムパイプラインを読むとき、diffusers は
         # コードを HF_HOME/modules に書き出す。gcsfuse で読み取り専用に
