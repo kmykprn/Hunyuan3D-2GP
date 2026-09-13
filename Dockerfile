@@ -104,6 +104,11 @@ COPY hy3dgen/texgen/differentiable_renderer hy3dgen/texgen/differentiable_render
 RUN pip install --no-build-isolation ./hy3dgen/texgen/custom_rasterizer \
  && pip install --no-build-isolation ./hy3dgen/texgen/differentiable_renderer
 
+# triton は torch.compile 用で、ワーカーは --compile を付けないので使わない。
+# 473MB の共有ライブラリが import 時にマップされ、Cloud Run では起動のたびに
+# イメージから読まれる（image streaming、約 60MB/s）ので外す
+RUN pip uninstall -y triton
+
 # ══════════════════════════════════════════════════════
 # runtime ── nvcc もコンパイラも持たない、実行だけの層
 # ══════════════════════════════════════════════════════
