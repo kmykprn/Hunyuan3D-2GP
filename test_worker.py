@@ -175,9 +175,6 @@ check("同じ工程が二度書かれない", len(seen_mt) == len(set(seen_mt)) 
 check("順序が前向き", seen_mt == phases, str(seen_mt))
 
 
-print()
-print(f"{sum(results)}/{len(results)} 成功")
-sys.exit(0 if all(results) else 1)
 
 
 # --- ジョブの種類 ---
@@ -195,3 +192,18 @@ try:
     check("画像が欠けていれば失敗", False, "例外が出なかった")
 except RuntimeError as e:
     check("画像が欠けていれば失敗", "出力されていない" in str(e), str(e))
+
+
+# --- 重みの取得 ---
+check("WEIGHTS_BUCKET が無ければ何もしない", w.WEIGHTS_BUCKET == "" and w._fetch_weights() is None)
+check("生成スクリプトはネットへ取りに行かない", w._child_env()["HF_HUB_OFFLINE"] == "1")
+check("重みは HF_HOME の hub/ に置く", w.WEIGHTS_DIR.endswith("/hub"))
+import tempfile
+with tempfile.NamedTemporaryFile("w", suffix="main", delete=False) as f:
+    f.write("f90a0f7df7d5e6f71109cf333f6a95a0ae3194a6\n"); ref_path = f.name
+w._strip_ref(ref_path)
+check("refs の改行を落とす", open(ref_path).read() == "f90a0f7df7d5e6f71109cf333f6a95a0ae3194a6")
+
+print()
+print(f"{sum(results)}/{len(results)} 成功")
+sys.exit(0 if all(results) else 1)

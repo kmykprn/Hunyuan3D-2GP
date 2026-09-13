@@ -7,10 +7,7 @@
 # MV-Adapter は 6 方向（0/45/90/180/270/315）で学習されているが、方位角は
 # カメラ条件として渡す作りなので 8 方向も指定できる。135° と 225° は学習外。
 #
-# 重みは /models/mvadapter（GCS の gcsfuse マウント）にある。**そこから直接
-# 読まない。** safetensors は mmap でランダムに読むため、gcsfuse 越しだと
-# 1 回のページフォルトが 1 回のレンジ要求になって致命的に遅い（3D 側で
-# 25 分かかった実績）。先に /tmp へ順に写してから読む。順読みなら 100MB/s 出る
+# 重みは HF_HOME/mvadapter に置いてある前提（ワーカーが起動時に落とす。いまは配置していない）。
 #
 # 出力は灰色の背景付きなので、切り抜きサービスと同じ BiRefNet（CPU）で背景を抜き、
 # **8 枚に共通の範囲**で切り詰める。1 枚ずつ切り詰めると向きごとに大きさが変わり、
@@ -18,7 +15,6 @@
 
 import argparse
 import os
-import shutil
 import sys
 import time
 
@@ -37,20 +33,6 @@ AZIMUTHS = [0, 45, 90, 135, 180, 225, 270, 315]
 NEGATIVE_PROMPT = "watermark, ugly, deformed, noisy, blurry, low contrast"
 # 背景を抜くモデル。Dockerfile がイメージに焼く（cutout/Dockerfile と同じ配布物）
 BIREFNET_PATH = "/opt/birefnet/birefnet-general-lite.onnx"
-
-
-def copy_weights(src: str, dst: str) -> None:
-    """マウントから /tmp へ順に写す。写した量を出しておくと遅いときに切り分けやすい"""
-    started = time.perf_counter()
-    total = 0
-    for root, _dirs, files in os.walk(src):
-        rel = os.path.relpath(root, src)
-        os.makedirs(os.path.join(dst, rel), exist_ok=True)
-        for name in files:
-            path = os.path.join(root, name)
-            shutil.copyfile(path, os.path.join(dst, rel, name))
-            total += os.path.getsize(path)
-    print(f"weights copied: {total / 1e9:.1f}GB in {time.perf_counter() - started:.0f}s", flush=True)
 
 
 def load_pipeline(weights_dir: str, num_views: int) -> MVAdapterI2MVSDXLPipeline:
@@ -86,8 +68,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-image", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--weights-mount", default="/models/mvadapter")
-    parser.add_argument("--weights-dir", default="/tmp/mvadapter")
+    parser.add_argument("--weights-dir", default=os.path.join(os.environ.get("HF_HOME", "/tmp/models"), "mvadapter"))
     parser.add_argument("--size", type=int, default=768)
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
@@ -96,12 +77,7 @@ def main() -> int:
 
     num_views = len(AZIMUTHS)
     print("=== Loading multiview model ===", flush=True)
-    if not os.path.isdir(args.weights_dir):
-        copy_weights(args.weights_mount, args.weights_dir)
     pipe = load_pipeline(args.weights_dir, num_views)
-    # 読み終わった写しは要らない。/tmp はメモリなので、残すとそのぶん VRAM 側と取り合う
-    if args.weights_dir.startswith("/tmp"):
-        shutil.rmtree(args.weights_dir, ignore_errors=True)
 
     cameras = get_orthogonal_camera(
         elevation_deg=[0] * num_views, distance=[1.8] * num_views,
