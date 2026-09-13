@@ -17,8 +17,6 @@ import os
 import time
 
 import firebase_admin
-import numpy as np
-import onnxruntime as ort
 import pillow_heif
 from fastapi import FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.responses import StreamingResponse
@@ -27,6 +25,8 @@ from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import PreconditionFailed
 from google.cloud import storage
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+from birefnet import crop_to_content, load_session, predict_mask, to_png
 
 # iPhone が既定で送る HEIC/HEIF を Pillow で開けるようにする
 pillow_heif.register_heif_opener()
@@ -46,12 +46,8 @@ ALLOWED_ORIGINS = [
 ]
 
 # モデルの重み。Dockerfile がイメージに焼く（md5 で検証済み）。
-# BiRefNet-general-lite（MIT）。入力は 1024×1024 固定
+# BiRefNet-general-lite（MIT）。前処理・後処理は birefnet.py
 MODEL_PATH = os.environ.get("MODEL_PATH", "/models/birefnet-general-lite.onnx")
-MODEL_INPUT_SIZE = 1024
-# ImageNet の平均と分散。学習時と同じ値でないと精度が落ちる
-MODEL_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-MODEL_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
@@ -68,13 +64,6 @@ ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP", "HEIF", "HEIC", "MPO"}
 # 返す切り抜きの長辺。モデルの入力と同じにしておく。
 # これより大きく返しても、輪郭の精度は 1024 で頭打ちになる
 MAX_EDGE = 1024
-
-# 切り抜きを内容の周りで切り詰めるときの余白（辺に対する比）。
-# ぴったりに切ると、輪郭のぼかしが端で切れて縁が硬く見える
-CROP_MARGIN = 0.02
-
-# 「中身がある」とみなす不透明度。これ未満しかない行や列は切り落とす
-CROP_ALPHA_THRESHOLD = 8
 
 # 推論の直近の所要秒数。応答に「見込み」として載せ、画面の円の進み方に使ってもらう。
 # 起動直後で実測が無いときの既定は、4 vCPU での実測に合わせてある
@@ -97,24 +86,7 @@ firebase_admin.initialize_app()
 _storage = storage.Client()
 
 
-def _load_session() -> ort.InferenceSession:
-    """モデルを読む。起動時に 1 度だけ。
-
-    **メモリアリーナは切る。** 入れたままだと推論のたびにアリーナが伸び、
-    3 回目には 11GB を超える（実測）。切れば 6.4GB で安定する。
-    コンテナのメモリ上限（12Gi）はこの数字から決めてある
-    """
-    options = ort.SessionOptions()
-    options.enable_cpu_mem_arena = False
-    # 同時実行は 1（Cloud Run の設定）なので、CPU は全部この 1 件に使う
-    options.intra_op_num_threads = INFERENCE_THREADS
-    options.inter_op_num_threads = 1
-    # 見立てを後から確かめられるように、環境が見せる CPU 数と実際に使う数を残す
-    print(f"inference threads={INFERENCE_THREADS} (os.cpu_count={os.cpu_count()})", flush=True)
-    return ort.InferenceSession(MODEL_PATH, options, providers=["CPUExecutionProvider"])
-
-
-_session = _load_session()
+_session = load_session(MODEL_PATH, INFERENCE_THREADS)
 
 
 # --- 認証と回数 ---------------------------------------------------------
@@ -223,53 +195,6 @@ def _decode_image(data: bytes) -> Image.Image:
     return img
 
 
-def _normalize(img: Image.Image) -> np.ndarray:
-    """モデルの入力にする。1024×1024 に伸ばし、ImageNet の平均と分散で正規化する。
-
-    縦横比は保たない（モデルが正方形固定）。出力側で元の大きさに戻すので歪みは残らない
-    """
-    resized = img.resize((MODEL_INPUT_SIZE, MODEL_INPUT_SIZE), Image.LANCZOS)
-    array = np.asarray(resized, dtype=np.float32) / 255.0
-    array = (array - MODEL_MEAN) / MODEL_STD
-    return array.transpose(2, 0, 1)[None]
-
-
-def _predict_mask(img: Image.Image) -> Image.Image:
-    """不透明度のマスク（元画像と同じ大きさ、L モード）を返す。"""
-    input_name = _session.get_inputs()[0].name
-    logits = _session.run(None, {input_name: _normalize(img)})[0][0, 0]
-    # sigmoid で 0〜1 にしたあと、最小と最大で引き伸ばす。
-    # 引き伸ばさないと、輪郭がはっきりした写真でも背景がうっすら残る
-    pred = 1.0 / (1.0 + np.exp(-logits))
-    low, high = pred.min(), pred.max()
-    if high > low:
-        pred = (pred - low) / (high - low)
-    mask = Image.fromarray((pred * 255).astype(np.uint8), mode="L")
-    return mask.resize(img.size, Image.LANCZOS)
-
-
-def _crop_to_content(rgba: Image.Image) -> Image.Image:
-    """透明な余白を切り落とす。少しだけ余白を残す。
-
-    アプリ側はこの画像を板に貼るので、余白が多いと板の大きさと物の大きさが
-    ずれ、ドラッグで掴める範囲が物からはみ出す。何も残らなければそのまま返す
-    """
-    alpha = np.asarray(rgba.getchannel("A"))
-    rows = np.where(alpha.max(axis=1) >= CROP_ALPHA_THRESHOLD)[0]
-    cols = np.where(alpha.max(axis=0) >= CROP_ALPHA_THRESHOLD)[0]
-    if len(rows) == 0 or len(cols) == 0:
-        return rgba
-    top, bottom, left, right = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
-    margin_y = int((bottom - top) * CROP_MARGIN)
-    margin_x = int((right - left) * CROP_MARGIN)
-    return rgba.crop((
-        max(0, left - margin_x),
-        max(0, top - margin_y),
-        min(rgba.width, right + margin_x),
-        min(rgba.height, bottom + margin_y),
-    ))
-
-
 def _expected_inference_seconds() -> float:
     """次の推論にかかりそうな秒数。直近の平均。"""
     if not RECENT_INFERENCE_SECONDS:
@@ -280,7 +205,7 @@ def _expected_inference_seconds() -> float:
 def _timed_predict_mask(img: Image.Image) -> Image.Image:
     """推論して、かかった秒数を覚える。"""
     started = time.perf_counter()
-    mask = _predict_mask(img)
+    mask = predict_mask(_session, img)
     RECENT_INFERENCE_SECONDS.append(time.perf_counter() - started)
     return mask
 
@@ -289,9 +214,7 @@ def _finish(img: Image.Image, mask: Image.Image) -> bytes:
     """マスクをアルファに入れ、余白を切り落として PNG にする。"""
     rgba = img.convert("RGBA")
     rgba.putalpha(mask)
-    out = io.BytesIO()
-    _crop_to_content(rgba).save(out, format="PNG")
-    return out.getvalue()
+    return to_png(crop_to_content(rgba))
 
 
 def _event(phase: str, **fields) -> bytes:

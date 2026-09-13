@@ -19,7 +19,7 @@ import firebase_admin
 import google.auth
 import google.auth.transport.requests
 import pillow_heif
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import NotFound, PreconditionFailed
@@ -146,7 +146,14 @@ _JOB_BASE = (
 )
 
 
-def _start_job(job_id: str, slot: int) -> str:
+# ジョブの種類。同じ GPU ワーカーで、入力画像から何を作るかが変わる。
+#   model … 3D モデル（GLB）。約 9 分
+#   views … 45° 刻み 8 方向の画像。約 3 分。切り抜きを向きを変えて置くためのもの
+JOB_KINDS = ("model", "views")
+VIEW_AZIMUTHS = (0, 45, 90, 135, 180, 225, 270, 315)
+
+
+def _start_job(job_id: str, slot: int, kind: str = "model") -> str:
     """ジョブを起動し、execution 名を返す。
 
     どの入力を処理するかは環境変数の上書きで伝える。ジョブ側は
@@ -161,6 +168,7 @@ def _start_job(job_id: str, slot: int) -> str:
                         "env": [
                             {"name": "JOB_ID", "value": job_id},
                             {"name": "JOB_SLOT", "value": str(slot)},
+                            {"name": "JOB_KIND", "value": kind},
                         ]
                     }
                 ]
@@ -254,6 +262,15 @@ def _elapsed_seconds(since: str | None) -> int:
 
 
 def _signed_model_url(job_id: str) -> str:
+    return _signed_url(f"jobs/{job_id}/model.glb")
+
+
+def _signed_view_urls(job_id: str) -> dict:
+    """8 方向の画像の署名付きURL。方位角（度）の文字列をキーにする"""
+    return {str(azimuth): _signed_url(f"jobs/{job_id}/views/{azimuth:03d}.png") for azimuth in VIEW_AZIMUTHS}
+
+
+def _signed_url(path: str) -> str:
     """成果物の署名付きURLを発行する。
 
     Cloud Run のサービスアカウントは秘密鍵を持たないため、
@@ -275,7 +292,7 @@ def _signed_model_url(job_id: str) -> str:
     if not credentials.valid or not getattr(credentials, "service_account_email", None):
         credentials.refresh(google.auth.transport.requests.Request())
 
-    return _bucket().blob(f"jobs/{job_id}/model.glb").generate_signed_url(
+    return _bucket().blob(path).generate_signed_url(
         version="v4",
         expiration=SIGNED_URL_TTL,
         method="GET",
@@ -662,7 +679,7 @@ def _dispatch_queued_jobs() -> None:
             _clear_dispatch_claim(claimed["jobId"], claimed["dispatchClaimedAt"])
             return
         try:
-            execution_name = _start_job(claimed["jobId"], slot)
+            execution_name = _start_job(claimed["jobId"], slot, claimed.get("kind", "model"))
         except Exception as error:
             _mark_start_failed(claimed, slot, error)
             continue
@@ -849,10 +866,14 @@ def _normalize_image(data: bytes) -> bytes:
 
 @app.post("/jobs", status_code=202)
 async def create_job(
-    image: UploadFile = File(...), authorization: str | None = Header(default=None)
+    image: UploadFile = File(...),
+    kind: str = Form("model"),
+    authorization: str | None = Header(default=None),
 ):
     uid, email = _identity_from_token(authorization)
     _check_allowed(uid, email)
+    if kind not in JOB_KINDS:
+        raise HTTPException(status_code=400, detail=f"kind は {' / '.join(JOB_KINDS)} のどれか")
 
     data = await image.read()
     if not data:
@@ -872,6 +893,7 @@ async def create_job(
     status = {
         "jobId": job_id,
         "uid": uid,
+        "kind": kind,
         "state": "queued",
         "createdAt": now,
         "updatedAt": now,
@@ -934,8 +956,10 @@ def get_job(job_id: str, authorization: str | None = Header(default=None)):
     if status["state"] in ("succeeded", "failed"):
         _dispatch_queued_jobs()
 
+    kind = status.get("kind", "model")
     body = {
         "state": status["state"],
+        "kind": kind,
         "createdAt": status["createdAt"],
     }
     # いまの工程。ジョブ側が書けたときだけ入る。
@@ -950,7 +974,10 @@ def get_job(job_id: str, authorization: str | None = Header(default=None)):
         if status["state"] == "running":
             body["phaseElapsedSeconds"] = _elapsed_seconds(status.get("phaseStartedAt"))
     if status["state"] == "succeeded":
-        body["modelUrl"] = _signed_model_url(job_id)
+        if kind == "views":
+            body["viewUrls"] = _signed_view_urls(job_id)
+        else:
+            body["modelUrl"] = _signed_model_url(job_id)
     if status.get("error"):
         body["error"] = status["error"]
     return body

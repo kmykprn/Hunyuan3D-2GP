@@ -192,7 +192,7 @@ with mock.patch.object(main, "_read_quota", racy_read):
 
 # --- 切り詰め ---
 empty = Image.new("RGBA", (50, 40), (0, 0, 0, 0))
-check("何も残らなければそのまま返す", main._crop_to_content(empty).size == (50, 40))
+check("何も残らなければそのまま返す", main.crop_to_content(empty).size == (50, 40))
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")

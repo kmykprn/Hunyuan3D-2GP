@@ -91,11 +91,13 @@ def _update_status(job_id: str, **changes) -> None:
     raise RuntimeError(f"status.json を更新できなかった: {job_id}")
 
 
-# 生成の工程。minimal_demo_mmgp.py が出す印と、状態に書く名前の対。
+# ジョブの種類ごとの、動かすスクリプトと工程の印。
 #
 # 印は標準出力と標準エラーに**またがる**。工程の区切りには print で
 # 標準出力に出るものと、logging で標準エラーに出るものが混在している。
 # どちらか片方だけを見ると、その工程が丸ごと落ちる。
+#
+# model … 3D モデル。minimal_demo_mmgp.py が出す印
 PHASE_MARKERS: tuple[tuple[str, str], ...] = (
     ("=== Loading texture generation model ===", "loading_texture_model"),
     ("=== Loading i23d model ===", "loading_shape_model"),
@@ -110,6 +112,55 @@ PHASE_MARKERS: tuple[tuple[str, str], ...] = (
     ("---Face Reduction takes", "generating_texture"),
     ("3D model with texture generated successfully!", "finishing"),
 )
+
+# views … 45° 刻み 8 方向の画像。multiview.py が出す印
+VIEW_PHASE_MARKERS: tuple[tuple[str, str], ...] = (
+    ("=== Loading multiview model ===", "loading_views_model"),
+    ("=== Generating views ===", "generating_views"),
+    ("=== Cutting out views ===", "cutting_views"),
+    ("=== Views generated ===", "finishing"),
+)
+
+# 8 方向の出力先。ファイル名は方位角（度）
+VIEWS_DIR = "/tmp/views"
+VIEW_AZIMUTHS = (0, 45, 90, 135, 180, 225, 270, 315)
+
+
+def _job_command(kind: str, input_path: str) -> list[str]:
+    """種類ごとに動かすスクリプト。どちらも -u で行ごとに流させる（下の説明を参照）"""
+    if kind == "views":
+        return [sys.executable, "-u", "multiview.py", "--input-image", input_path, "--output-dir", VIEWS_DIR]
+    return [
+        sys.executable, "-u", "minimal_demo_mmgp.py",
+        "--input-image", input_path, "--output", "/tmp/output", "--texture", "--profile", "3",
+    ]
+
+
+def _upload_views(job_id: str) -> None:
+    """8 方向の画像を jobs/{id}/views/ に置く。1 枚でも欠けていれば失敗"""
+    for azimuth in VIEW_AZIMUTHS:
+        path = os.path.join(VIEWS_DIR, f"{azimuth:03d}.png")
+        if not os.path.exists(path):
+            raise RuntimeError(f"{azimuth}° の画像が出力されていない")
+    for azimuth in VIEW_AZIMUTHS:
+        _bucket.blob(f"jobs/{job_id}/views/{azimuth:03d}.png").upload_from_filename(
+            os.path.join(VIEWS_DIR, f"{azimuth:03d}.png")
+        )
+
+
+def _upload_model(job_id: str) -> None:
+    """できあがった GLB を jobs/{id}/model.glb に置く。"""
+    produced = glob.glob(CACHE_GLOB)
+    if not produced:
+        # テクスチャ生成が無効なまま完走すると white_mesh しか出ない。
+        # PR #2 で潰した「失敗しているのに成功と報告する」経路がこれ
+        raise RuntimeError(
+            "textured_mesh.glb が出力されていない。"
+            "テクスチャ生成が無効になっていないか、ログを確認すること"
+        )
+    if len(produced) > 1:
+        raise RuntimeError(f"出力が複数ある: {produced}")
+    _bucket.blob(f"jobs/{job_id}/model.glb").upload_from_filename(produced[0])
 
 # 標準エラーのうち手元に残す行数。失敗の理由に使うのは末尾だけで、
 # 全文は素通し済みなので Cloud Logging にある
@@ -145,16 +196,17 @@ class PhaseTracker:
     標準出力と標準エラーの2スレッドから食わせるので、位置は錠で守る。
     """
 
-    def __init__(self, job_id: str) -> None:
+    def __init__(self, job_id: str, markers: tuple[tuple[str, str], ...] = PHASE_MARKERS) -> None:
         self._job_id = job_id
+        self._markers = markers
         self._index = 0
         self._lock = threading.Lock()
 
     def feed(self, line: str) -> None:
         phase = None
         with self._lock:
-            for offset in range(self._index, len(PHASE_MARKERS)):
-                marker, candidate = PHASE_MARKERS[offset]
+            for offset in range(self._index, len(self._markers)):
+                marker, candidate = self._markers[offset]
                 if marker in line:
                     self._index = offset + 1
                     phase = candidate
@@ -207,6 +259,8 @@ def main() -> int:
     if not job_id:
         print("JOB_ID が渡されていない", file=sys.stderr)
         return 1
+    # 何を作るか。API が status と同じ値を環境変数で渡す。無ければ 3D（古い API との互換）
+    kind = os.environ.get("JOB_KIND", "model")
 
     input_path = f"/tmp/{job_id}_input.png"
 
@@ -231,18 +285,10 @@ def main() -> int:
         # 書くため。**1行読んだらその場で素通しし、溜めない。** 溜めると
         # 親が全出力をメモリに持つことになり、余裕の無いメモリを圧迫する
         # （実測で OOM の一因になった）
+        # -u は出力を行ごとに流させるため。既定のままだと標準出力がパイプ相手に
+        # ブロックバッファされ、工程の印が数KB溜まるまで届かない
         process = subprocess.Popen(
-            [
-                sys.executable,
-                # 出力を行ごとに流させる。既定のままだと標準出力がパイプ相手に
-                # ブロックバッファされ、工程の印が数KB溜まるまで届かない
-                "-u",
-                "minimal_demo_mmgp.py",
-                "--input-image", input_path,
-                "--output", "/tmp/output",
-                "--texture",
-                "--profile", "3",
-            ],
+            _job_command(kind, input_path),
             cwd=REPO_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -250,7 +296,7 @@ def main() -> int:
             bufsize=1,
         )
 
-        phases = PhaseTracker(job_id)
+        phases = PhaseTracker(job_id, VIEW_PHASE_MARKERS if kind == "views" else PHASE_MARKERS)
         stderr_tail: collections.deque = collections.deque(maxlen=STDERR_KEEP_LINES)
         stderr_reader = threading.Thread(
             target=_drain_stderr, args=(process.stderr, stderr_tail, phases), daemon=True
@@ -278,18 +324,10 @@ def main() -> int:
             detail = lines[-1] if lines else "詳細はログを参照"
             raise RuntimeError(f"生成に失敗: {detail}")
 
-        produced = glob.glob(CACHE_GLOB)
-        if not produced:
-            # テクスチャ生成が無効なまま完走すると white_mesh しか出ない。
-            # PR #2 で潰した「失敗しているのに成功と報告する」経路がこれ
-            raise RuntimeError(
-                "textured_mesh.glb が出力されていない。"
-                "テクスチャ生成が無効になっていないか、ログを確認すること"
-            )
-        if len(produced) > 1:
-            raise RuntimeError(f"出力が複数ある: {produced}")
-
-        _bucket.blob(f"jobs/{job_id}/model.glb").upload_from_filename(produced[0])
+        if kind == "views":
+            _upload_views(job_id)
+        else:
+            _upload_model(job_id)
         _update_status(job_id, state="succeeded", error=None)
         _notify_dispatcher()
         print(f"完了: {job_id}")

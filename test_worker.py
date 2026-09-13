@@ -178,3 +178,20 @@ check("順序が前向き", seen_mt == phases, str(seen_mt))
 print()
 print(f"{sum(results)}/{len(results)} 成功")
 sys.exit(0 if all(results) else 1)
+
+
+# --- ジョブの種類 ---
+check("views の印は4つ", len(w.VIEW_PHASE_MARKERS) == 4, str(len(w.VIEW_PHASE_MARKERS)))
+BUCKET.store.clear()
+put("jv", {"jobId": "jv", "uid": "u", "state": "running", "kind": "views"})
+tracker = w.PhaseTracker("jv", w.VIEW_PHASE_MARKERS)
+for marker, _ in w.VIEW_PHASE_MARKERS:
+    tracker.feed(marker + "\n")
+check("views の印を順に拾う", get("jv")["phase"] == "finishing", str(get("jv")))
+check("views は multiview.py を動かす", "multiview.py" in w._job_command("views", "/tmp/x.png"))
+check("model は minimal_demo_mmgp.py を動かす", "minimal_demo_mmgp.py" in w._job_command("model", "/tmp/x.png"))
+try:
+    w._upload_views("jv")
+    check("画像が欠けていれば失敗", False, "例外が出なかった")
+except RuntimeError as e:
+    check("画像が欠けていれば失敗", "出力されていない" in str(e), str(e))
