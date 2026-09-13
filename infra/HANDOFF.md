@@ -317,7 +317,7 @@ terraform output cutout_url     # roomplanner-web の config/api.ts に書く
 | Cloud Run サービス `hunyuan3d-api` | API層。CPUのみ、最大3インスタンス、使わなければ0 |
 | Cloud Run ジョブ `hunyuan3d-measure` | 生成本体。**常駐しない**。APIから起動される |
 | Artifact Registry `hunyuan3d` | `hunyuan3d:v3`（9.6GB）と `api:v7`（207MB） |
-| 重みバケット | 21.1GB |
+| 重みバケット | `hub-fp16/` 約7GB（fp16 にそろえた HF キャッシュ構造）。ワーカーが起動時に /tmp へ並列ダウンロードする |
 | 生成物バケット | 入力画像・状態・成果物・回数。30日で自動削除 |
 | 設定バケット | 許可リスト。**APIは読むだけ**。versioning 有効 |
 | state バケット | Terraform の state |

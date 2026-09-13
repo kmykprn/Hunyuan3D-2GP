@@ -175,9 +175,6 @@ check("同じ工程が二度書かれない", len(seen_mt) == len(set(seen_mt)) 
 check("順序が前向き", seen_mt == phases, str(seen_mt))
 
 
-print()
-print(f"{sum(results)}/{len(results)} 成功")
-sys.exit(0 if all(results) else 1)
 
 
 # --- ジョブの種類 ---
@@ -195,3 +192,13 @@ try:
     check("画像が欠けていれば失敗", False, "例外が出なかった")
 except RuntimeError as e:
     check("画像が欠けていれば失敗", "出力されていない" in str(e), str(e))
+
+
+# --- 重みの取得 ---
+check("WEIGHTS_BUCKET が無ければ何もしない", w.WEIGHTS_BUCKET == "" and w._fetch_weights() is None)
+check("生成スクリプトはネットへ取りに行かない", w._child_env()["HF_HUB_OFFLINE"] == "1")
+check("重みは HF_HOME の hub/ に置く", w.WEIGHTS_DIR.endswith("/hub"))
+
+print()
+print(f"{sum(results)}/{len(results)} 成功")
+sys.exit(0 if all(results) else 1)

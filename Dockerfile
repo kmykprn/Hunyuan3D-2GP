@@ -128,6 +128,6 @@ COPY . .
 
 # 重みの置き場所。ローカルではホストの HuggingFace キャッシュを、
 # Cloud Run では GCS から落としたディレクトリをここにマウントする
-ENV HF_HOME=/models
+ENV HF_HOME=/tmp/models
 
 CMD ["python", "minimal_demo_mmgp.py"]

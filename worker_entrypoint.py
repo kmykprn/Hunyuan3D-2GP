@@ -26,16 +26,35 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 
 from google.api_core.exceptions import PreconditionFailed
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
+from google.cloud.storage import transfer_manager
 from google.oauth2 import id_token
 
 REPO_DIR = "/app"
 OUTPUTS_BUCKET = os.environ["OUTPUTS_BUCKET"]
+
+# モデルの重み。起動時にここから /tmp へ並列ダウンロードして読む。
+#
+# gcsfuse でマウントして読むと実効 50MB/s で 263 秒かかっていた（1 件の半分）。
+# FUSE は初回ダウンロードを並列化せず、diffusers の mmap とも相性が悪い。
+# GCS API で範囲を分けて並列に落とせば、ネットワークの帯域を使い切れる。
+# WEIGHTS_BUCKET が無ければ何もしない（手元で HF_HOME を直接マウントして動かすとき）
+WEIGHTS_BUCKET = os.environ.get("WEIGHTS_BUCKET", "")
+WEIGHTS_PREFIX = os.environ.get("WEIGHTS_PREFIX", "hub-fp16").strip("/")
+# HF_HOME の hub/ に、バケットの WEIGHTS_PREFIX/ と同じ構造で置く。
+# hy3dgen も diffusers も HF のキャッシュ構造（models--org--name/snapshots/…）で探す
+WEIGHTS_DIR = os.path.join(os.environ.get("HF_HOME", "/tmp/models"), "hub")
+# 大きなファイルは範囲を分けて並列に落とす。小さなファイルはまとめて並列に落とす
+LARGE_FILE_BYTES = 256 * 1024 * 1024
+DOWNLOAD_CHUNK_BYTES = 64 * 1024 * 1024
+DOWNLOAD_WORKERS = 16
 API_URL = os.environ.get("API_URL", "").rstrip("/")
 # 完了通知に使う ID トークンの aud。API 側と同じ値でなければ 401 になる
 DISPATCH_AUDIENCE = os.environ.get("DISPATCH_AUDIENCE", "")
@@ -52,6 +71,56 @@ CACHE_GLOB = os.path.join(REPO_DIR, "gradio_cache", "*", "textured_mesh.glb")
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def _fetch_weights() -> None:
+    """重みをバケットから /tmp へ落とす。読み込みの速さは、ほぼここで決まる。
+
+    大きなファイル（unet など）は 1 本ずつ範囲を分けて並列に、小さなファイル
+    （設定・トークナイザ）はファイル単位で並列に落とす。どちらも GCS API 直。
+    落とした量と秒数を出しておくと、遅いときにネットワークか読み込みかを切り分けられる
+    """
+    if not WEIGHTS_BUCKET:
+        return
+    started = time.perf_counter()
+    bucket = _storage.bucket(WEIGHTS_BUCKET)
+    blobs = [b for b in bucket.list_blobs(prefix=WEIGHTS_PREFIX + "/") if not b.name.endswith("/")]
+    if not blobs:
+        raise RuntimeError(f"重みが無い: gs://{WEIGHTS_BUCKET}/{WEIGHTS_PREFIX}/")
+
+    def local_path(blob) -> str:
+        path = os.path.join(WEIGHTS_DIR, blob.name[len(WEIGHTS_PREFIX) + 1:])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    large = [b for b in blobs if (b.size or 0) >= LARGE_FILE_BYTES]
+    small = [b for b in blobs if (b.size or 0) < LARGE_FILE_BYTES]
+    if small:
+        results = transfer_manager.download_many(
+            [(b, local_path(b)) for b in small], max_workers=DOWNLOAD_WORKERS
+        )
+        failed = [b.name for b, r in zip(small, results) if isinstance(r, Exception)]
+        if failed:
+            raise RuntimeError(f"重みを落とせなかった: {failed[:3]}")
+    # 大きなファイルは順に。1 本ずつでもチャンク並列で帯域は埋まる
+    for blob in large:
+        transfer_manager.download_chunks_concurrently(
+            blob, local_path(blob), chunk_size=DOWNLOAD_CHUNK_BYTES, max_workers=DOWNLOAD_WORKERS
+        )
+    total = sum(b.size or 0 for b in blobs)
+    elapsed = time.perf_counter() - started
+    print(
+        f"weights: {total / 1e9:.1f}GB in {len(blobs)} files, {elapsed:.0f}s "
+        f"({total / 1e6 / max(elapsed, 0.001):.0f}MB/s)",
+        flush=True,
+    )
+
+
+def _child_env() -> dict:
+    """生成スクリプトに渡す環境。重みは落とした先から読ませ、ネットへ取りに行かせない"""
+    env = dict(os.environ)
+    env["HF_HUB_OFFLINE"] = "1"
+    return env
 
 
 # status.json の書き込みを諦めるまでの回数。競合は API 層の書き込みと
@@ -278,6 +347,9 @@ def main() -> int:
             raise FileNotFoundError(f"入力画像が無い: jobs/{job_id}/input.png")
         src.download_to_filename(input_path)
 
+        # 重みはここで落とす。工程は preparing のまま（画面側の見込み秒数は実測で合わせる）
+        _fetch_weights()
+
         # 別プロセスにするのは、minimal_demo_mmgp.py が終了時フックや
         # グローバル状態を持っており、import して呼ぶと副作用が読みにくいため。
         #
@@ -290,6 +362,7 @@ def main() -> int:
         process = subprocess.Popen(
             _job_command(kind, input_path),
             cwd=REPO_DIR,
+            env=_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

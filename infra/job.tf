@@ -62,94 +62,36 @@ resource "google_cloud_run_v2_job" "measure" {
         accelerator = var.gpu_type
       }
 
-      # 重みをバケットから読む。gcsfuse でマウントするので、
-      # イメージにもコードにも手を入れずに済むのが利点。
+      # 重みは gcsfuse でマウントしない。起動時にワーカーが GCS API で並列ダウンロードして
+      # /tmp（メモリ）に置き、そこから読む（worker_entrypoint.py の _fetch_weights）。
       #
-      # ただし公式ガイドは「FUSE は初回ダウンロードを並列化しないので、
-      # 大きな重みでは gcloud storage cp より遅い」としている。
-      # ここで測った値が、並列ダウンロード方式と比較する際の基準になる
-      volumes {
-        name = "weights"
-        gcs {
-          bucket    = google_storage_bucket.weights.name
-          read_only = true
-
-          # ファイルキャッシュを有効にする。既定では無効で、その状態だと
-          # diffusers の from_pretrained が致命的に遅い。
-          # 実測ではテクスチャモデルのロードに25分40秒かかり（約2.2MB/s）、
-          # 30分のタイムアウトに達して生成まで到達しなかった。
-          #
-          # 原因は safetensors の mmap で、ページフォルトが1回ずつ
-          # GCS へのレンジリクエストになること。gcsfuse からは
-          # ランダムアクセスに見えるため先読みが効かない。
-          # 同じ症状が gcsfuse#2828 と diffusers#10280 に報告されている。
-          #
-          # 対比として、形状モデル(7.2GB の単一 safetensors)は同じマウントを
-          # 通して67秒(110MB/s)で読めている。gcsfuse が一律に遅いのではなく、
-          # diffusers の読み方が問題という切り分けになる。
-          mount_options = [
-            # ファイルキャッシュは cache-dir を指定して初めて有効になる。
-            # サイズ上限だけ書いても有効化されず、gcsfuse が
-            # 「file cache should be enabled for parallel download support」
-            # で起動に失敗する。
-            # Cloud Run では in-memory ボリュームを cr-volume:{名前} で参照する
-            "cache-dir=cr-volume:cache",
-            # このキャッシュは各ファイルを1回しか読まないので、再利用のためでは
-            # なく「gcsfuse に並列ダウンロードさせる」ために置いている。
-            # よって必要なのは最大の単一ファイル(unet 3.41GB)が収まる大きさだけ。
-            # 6144 にしたところ、アプリ側と合わせて 16GiB を超えて OOM で
-            # 落ちた（テクスチャ側は paint と delight の2本がロードされる）
-            "file-cache-max-size-mb=4096",
-            # file-cache-cache-file-for-range-read は付けない。
-            # 打ち手3として試したが 533秒 → 531秒 で効果が無く、一方で
-            # 範囲読みのたびにファイル全体をキャッシュに載せるためメモリを
-            # 余計に使う。メモリ使用率は実測で平均83.6%・ピークで上限到達
-            # しており、効果の無いものに割ける余裕がない。
-            #
-            # なお download-chunk-size-mb と parallel-downloads-per-file を
-            # 同時に引き上げたときも OOM した。これらのバッファは
-            # file-cache-max-size-mb とは別枠でメモリを食う
-            # (512MB × 32並列 = 最大16GB)ので、既定のままにしておく
-            # 大きなファイルの初回読み込みを並列化する
-            "file-cache-enable-parallel-downloads=true",
-            # 重みは実行中に変わらないので、メタデータは無期限にキャッシュしてよい
-            "metadata-cache-ttl-secs=-1",
-          ]
-        }
-      }
-
-      # 上の cache-dir が指す実体。Cloud Run にローカルディスクは無いので
-      # メモリ上に置くしかなく、その分はコンテナのメモリ上限(job_memory)に
-      # カウントされる。ここで 4GiB を使う。
-      #
-      # 上限が 16GiB だった頃(4CPU構成)はアプリ側に約12GiBしか残らず、
-      # キャッシュを 6GiB にしたときは OOM(signal 9)で落ちた。
-      # 現在は 32GiB あり、実測ピークは 16.3GiB
-      # (キャッシュ4GiB＋アプリ約12GiB)で収まっている
-      volumes {
-        name = "cache"
-        empty_dir {
-          medium     = "MEMORY"
-          size_limit = "4Gi"
-        }
-      }
-
-
+      # 以前は gcsfuse + メモリ上のファイルキャッシュ 4GiB で読んでいたが、実効 50MB/s で
+      # 読み込みに 263 秒（1 件 522 秒の半分）かかっていた。公式も「FUSE は初回ダウンロードを
+      # 並列化しないので大きな重みでは gcloud storage cp より遅い」としている。
+      # 重みを fp16 にそろえて 7GB にしたので、/tmp に置いても 32GiB に収まる
       containers {
         image = var.image
 
-        # HF_HOME 配下の hub/ をそのまま使うので、
-        # ~/.cache/huggingface を丸ごとバケットに上げておけばよい
+        # 重みの置き場（ダウンロード先）。HF_HOME の hub/ 配下に、バケットの hub-fp16/ と
+        # 同じ構造（~/.cache/huggingface/hub と同じ）で置く。hy3dgen も diffusers もそこを探す
         env {
           name  = "HF_HOME"
-          value = "/models"
+          value = "/tmp/models"
+        }
+        env {
+          name  = "WEIGHTS_BUCKET"
+          value = google_storage_bucket.weights.name
+        }
+        env {
+          name  = "WEIGHTS_PREFIX"
+          value = "hub-fp16"
         }
 
         # trust_remote_code でカスタムパイプラインを読むとき、diffusers は
-        # コードを HF_HOME/modules に書き出す。HF_HOME はバケットの
-        # 読み取り専用マウントなので書けず、
-        # 「[Errno 30] Read-only file system: '/models/modules'」で
-        # テクスチャ生成モデルのロードが失敗する。
+        # コードを HF_HOME/modules に書き出す。gcsfuse で読み取り専用に
+        # マウントしていた頃は「[Errno 30] Read-only file system: '/models/modules'」で
+        # テクスチャ生成モデルのロードが失敗した。いまは /tmp なので書けるが、
+        # 重みと混ぜないために別の場所のまま残している。
         #
         # refs/main への書き込み失敗は Ignored error として無視されるが、
         # modules は無視されない。ローカル実行では ~/.cache/huggingface が
@@ -190,17 +132,6 @@ resource "google_cloud_run_v2_job" "measure" {
         }
 
 
-        volume_mounts {
-          name       = "weights"
-          mount_path = "/models"
-        }
-
-        # gcsfuse のキャッシュ実体。cache-dir から cr-volume: で参照するだけでなく、
-        # in-memory ボリュームはコンテナにマウントする必要がある
-        volume_mounts {
-          name       = "cache"
-          mount_path = "/gcsfuse-cache"
-        }
 
         # GPU ごとに下限が決まっている。
         #   nvidia-l4            : 4 CPU / 16GiB 以上

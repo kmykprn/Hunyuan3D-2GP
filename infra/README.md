@@ -60,7 +60,7 @@ terraform output image_repository       # push 先が出る
 docker tag hunyuan3d:local <出力>/hunyuan3d:v1
 docker push <出力>/hunyuan3d:v1
 
-# 2. 重みを上げる（約20GB。並列ダウンロードのため cp を使う）
+# 2. 重みを上げる（fp16 にそろえた hub-fp16/ 約7GB。infra/HANDOFF.md「重み」を参照）
 terraform output weights_bucket
 gcloud storage cp --recursive ~/.cache/huggingface/* gs://.../
 

@@ -37,7 +37,7 @@ docker build -t hunyuan3d:local .
 
 ```bash
 docker run --rm --gpus all \
-  -v "$HOME/.cache/huggingface:/models" \
+  -v "$HOME/.cache/huggingface:/tmp/models" \
   -v "$(pwd)/output:/app/output" \
   hunyuan3d:local \
   python minimal_demo_mmgp.py \
@@ -53,7 +53,7 @@ docker run --rm --gpus all \
 
 ```bash
 docker run --rm --gpus all \
-  -v "$HOME/.cache/huggingface:/models" \
+  -v "$HOME/.cache/huggingface:/tmp/models" \
   -v "$(pwd)/output:/app/output" \
   -v "$(pwd)/measure_result.txt:/app/measure_result.txt" \
   hunyuan3d:local \
@@ -77,7 +77,7 @@ Cloud Run での見積もりの土台が固くなる。
 | diso が CPU 版でビルドされ、`cuda_runtime.h` が見つからない | ビルド中はGPUが見えず `torch.cuda.is_available()` が False になり、CUDA版ではなくCPU版が選ばれる。`FORCE_CUDA=1` で回避する |
 | **面数削減で `Unknown format for load: ply`** | `libopengl0` の欠落。`libgl1` が入れる `libGL.so.1` とは別物で、無いと pymeshlab のプラグインが全滅し対応形式がひとつも登録されない。**モデルのロードと形状生成は成功して見えるため原因が遠い** |
 | 拡張のビルドが `setup.py install is deprecated` で止まる | Dockerfile では `pip install .` を使っている。もし `setup.py install` に戻すなら `pip install "setuptools<80"` で固定する |
-| モデルのダウンロードが始まる | マウント先が違う。`HF_HOME=/models` なので `~/.cache/huggingface` を `/models` に渡す |
+| モデルのダウンロードが始まる | マウント先が違う。`HF_HOME=/tmp/models` なので `~/.cache/huggingface` を `/tmp/models` に渡す（Cloud Run では起動時にバケットから同じ場所へ落とす） |
 | builder で `ensurepip is not available` | `python3.10-venv` の入れ忘れ。venv を作るのに必要 |
 | runtime で共有ライブラリが足りない | 実測では起きなかった。torch が `nvidia-*-cu12` を venv 内に同梱するため、CUDAランタイムは venv ごと運ばれる。もし起きたら両ステージで `ldd` を取って差分を見る |
 
