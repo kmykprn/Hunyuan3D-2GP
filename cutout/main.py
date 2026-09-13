@@ -7,16 +7,21 @@
 #
 # 状態は 1 日の回数だけ。GCS のファイルで数える（api/main.py と同じ作り）。
 
+import asyncio
+import base64
+import collections
 import datetime
 import io
 import json
 import os
+import time
 
 import firebase_admin
 import numpy as np
 import onnxruntime as ort
 import pillow_heif
 from fastapi import FastAPI, File, Header, HTTPException, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import PreconditionFailed
@@ -70,6 +75,11 @@ CROP_MARGIN = 0.02
 
 # 「中身がある」とみなす不透明度。これ未満しかない行や列は切り落とす
 CROP_ALPHA_THRESHOLD = 8
+
+# 推論の直近の所要秒数。応答に「見込み」として載せ、画面の円の進み方に使ってもらう。
+# 起動直後で実測が無いときの既定は、4 vCPU での実測に合わせてある
+RECENT_INFERENCE_SECONDS: collections.deque[float] = collections.deque(maxlen=5)
+DEFAULT_INFERENCE_SECONDS = 8.0
 
 app = FastAPI()
 
@@ -260,13 +270,33 @@ def _crop_to_content(rgba: Image.Image) -> Image.Image:
     ))
 
 
-def _cut_out(img: Image.Image) -> bytes:
-    """切り抜いた透過 PNG を返す。"""
+def _expected_inference_seconds() -> float:
+    """次の推論にかかりそうな秒数。直近の平均。"""
+    if not RECENT_INFERENCE_SECONDS:
+        return DEFAULT_INFERENCE_SECONDS
+    return sum(RECENT_INFERENCE_SECONDS) / len(RECENT_INFERENCE_SECONDS)
+
+
+def _timed_predict_mask(img: Image.Image) -> Image.Image:
+    """推論して、かかった秒数を覚える。"""
+    started = time.perf_counter()
+    mask = _predict_mask(img)
+    RECENT_INFERENCE_SECONDS.append(time.perf_counter() - started)
+    return mask
+
+
+def _finish(img: Image.Image, mask: Image.Image) -> bytes:
+    """マスクをアルファに入れ、余白を切り落として PNG にする。"""
     rgba = img.convert("RGBA")
-    rgba.putalpha(_predict_mask(img))
+    rgba.putalpha(mask)
     out = io.BytesIO()
     _crop_to_content(rgba).save(out, format="PNG")
     return out.getvalue()
+
+
+def _event(phase: str, **fields) -> bytes:
+    """応答の 1 行。NDJSON（1 行 1 JSON）。"""
+    return (json.dumps({"phase": phase, **fields}) + "\n").encode()
 
 
 # --- 入口 ---------------------------------------------------------------
@@ -280,8 +310,24 @@ def health():
 
 @app.post("/cutouts")
 async def create_cutout(
-    image: UploadFile = File(...), authorization: str | None = Header(default=None)
+    image: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+    accept: str | None = Header(default=None),
 ):
+    """切り抜く。Accept が application/x-ndjson なら工程を 1 行ずつ流し、そうでなければ PNG を返す（SPEC.md）。
+
+    2 通りあるのは切り替えの順序のため。配信済みの画面は PNG を待っているので、
+    先にサーバーを流す形だけにすると、画面を更新するまでの間ずっと失敗する。
+    画面が NDJSON を読めるようになったら PNG の形は消してよい。
+
+    推論そのものは途中経過を出せない（onnxruntime の中で止まる）ので、流せるのは
+    「受け付けた → 推論中（見込み秒数つき）→ 仕上げ → 完成」の 4 つ。
+    それでも、1 行目が届くまでが「起動待ち」だと画面側で区別できる。
+    コールドスタートで 15 秒黙っている間、画面が嘘の円を出さずに済む。
+
+    認証・画像の検証・回数は、ストリームを始める前に普通の HTTP エラーで返す。
+    始めたあとの失敗は最後の行（failed）で伝える。ヘッダはもう送ってしまっているため
+    """
     uid, _email = _identity_from_token(authorization)
 
     data = await image.read()
@@ -298,10 +344,29 @@ async def create_cutout(
 
     # 推論の前に数える。後で数えると、同時に投げられた分が全部通ってしまう
     _consume_quota(uid)
-    try:
-        png = _cut_out(img)
-    except Exception:
-        # こちら都合の失敗は回数に数えない
-        _restore_quota(uid)
-        raise
-    return Response(content=png, media_type="image/png")
+
+    if "application/x-ndjson" not in (accept or ""):
+        try:
+            mask = await asyncio.to_thread(_timed_predict_mask, img)
+            png = await asyncio.to_thread(_finish, img, mask)
+        except Exception:
+            # こちら都合の失敗は回数に数えない
+            _restore_quota(uid)
+            raise
+        return Response(content=png, media_type="image/png")
+
+    async def stream():
+        try:
+            yield _event("received")
+            yield _event("cutting", expectedSeconds=round(_expected_inference_seconds(), 1))
+            # 推論は数秒ブロックする。イベントループを止めないよう別スレッドで
+            mask = await asyncio.to_thread(_timed_predict_mask, img)
+            yield _event("finishing")
+            png = await asyncio.to_thread(_finish, img, mask)
+            yield _event("done", png=base64.b64encode(png).decode())
+        except Exception as e:
+            # こちら都合の失敗は回数に数えない
+            _restore_quota(uid)
+            yield _event("failed", error=f"切り抜きに失敗: {e}")
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
