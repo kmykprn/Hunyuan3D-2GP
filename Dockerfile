@@ -86,6 +86,15 @@ RUN mkdir -p /opt/birefnet \
     && curl -fsSL "$BIREFNET_URL" -o /opt/birefnet/birefnet-general-lite.onnx \
     && echo "$BIREFNET_MD5  /opt/birefnet/birefnet-general-lite.onnx" | md5sum -c -
 
+# 3D 生成の前処理（rembg の背景除去）が使う u2net。rembg は無ければ起動時に GitHub から
+# 落とすが、ジョブは VPC 経由でインターネットへ出られない（出さない）ので、ここで焼く。
+# md5 は rembg が配布に付けている値
+ARG U2NET_URL=https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx
+ARG U2NET_MD5=60024c5c889badc19c04ad937298a77b
+RUN mkdir -p /opt/u2net \
+    && curl -fsSL "$U2NET_URL" -o /opt/u2net/u2net.onnx \
+    && echo "$U2NET_MD5  /opt/u2net/u2net.onnx" | md5sum -c -
+
 # 拡張のソースだけ先に入れてビルドする。
 # こうしておくと、アプリのコードを直してもこの重い層が再利用される
 COPY hy3dgen/texgen/custom_rasterizer       hy3dgen/texgen/custom_rasterizer
@@ -122,6 +131,9 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 # 背景を抜くモデル（224MB）。3D 生成では使わない
 COPY --from=builder /opt/birefnet /opt/birefnet
+# 3D 生成の前処理が使う u2net（176MB）。rembg はこの場所を U2NET_HOME で探す
+COPY --from=builder /opt/u2net /opt/u2net
+ENV U2NET_HOME=/opt/u2net
 
 WORKDIR /app
 COPY . .

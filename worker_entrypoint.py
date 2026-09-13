@@ -107,6 +107,11 @@ def _fetch_weights() -> None:
         transfer_manager.download_chunks_concurrently(
             blob, local_path(blob), chunk_size=DOWNLOAD_CHUNK_BYTES, max_workers=DOWNLOAD_WORKERS
         )
+    # refs/main の中身は commit の sha。末尾に改行が付いていると、オフライン参照が
+    # 「sha + 改行」のフォルダを探して見つけられない（実測）。落としたあとに整える
+    for blob in small:
+        if "/refs/" in blob.name:
+            _strip_ref(local_path(blob))
     total = sum(b.size or 0 for b in blobs)
     elapsed = time.perf_counter() - started
     print(
@@ -114,6 +119,14 @@ def _fetch_weights() -> None:
         f"({total / 1e6 / max(elapsed, 0.001):.0f}MB/s)",
         flush=True,
     )
+
+
+def _strip_ref(path: str) -> None:
+    """HF キャッシュの refs ファイルから改行と空白を落とす。"""
+    with open(path, "r", encoding="utf-8") as f:
+        sha = f.read().strip()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(sha)
 
 
 def _child_env() -> dict:

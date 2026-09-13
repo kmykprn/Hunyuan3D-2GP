@@ -46,6 +46,15 @@ resource "google_cloud_run_v2_job" "measure" {
     template {
       service_account = google_service_account.job.email
 
+      # 外向きの通信を VPC 経由にする（network.tf）。重みのダウンロードが速くなる
+      vpc_access {
+        network_interfaces {
+          network    = google_compute_network.jobs.name
+          subnetwork = google_compute_subnetwork.jobs.name
+        }
+        egress = "ALL_TRAFFIC"
+      }
+
       # 失敗したジョブを黙って再実行させない。
       # GPU は秒課金なので、リトライは費用がそのまま倍になる。
       # 失敗したら理由を見てから手で回す
