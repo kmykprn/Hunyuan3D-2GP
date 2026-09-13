@@ -4,7 +4,7 @@
 偽物に差し替え、認証・回数・画像の検証・切り詰めを確かめる。
 main.py は読み込み時に GCS / Firebase / モデルへ繋ぎに行くので、import する前に差し替える。
 """
-import io, json, os, sys
+import base64, io, json, os, sys
 from unittest import mock
 
 import numpy as np
@@ -82,12 +82,22 @@ main.fb_auth.verify_id_token = fake_verify
 def png_bytes(size=(800, 600), color=(200, 100, 50)):
     buf = io.BytesIO(); Image.new("RGB", size, color).save(buf, "PNG"); return buf.getvalue()
 
-def post(token, data=png_bytes(), filename="photo.png"):
+def post(token, data=png_bytes(), filename="photo.png", stream=True):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
+    # 画面は Accept で流す形を頼む。付けなければ PNG（配信済みの画面向け）
+    if stream: headers["Accept"] = "application/x-ndjson"
     return client.post("/cutouts", files={"image": (filename, data, "image/png")}, headers=headers)
 
 def reset():
     BUCKET.store.clear(); BUCKET.seq = 0
+
+def events(response):
+    """NDJSON の応答を行ごとの dict にする"""
+    return [json.loads(line) for line in response.text.splitlines() if line]
+
+def result_png(response):
+    """最後の行（done）の PNG を取り出す"""
+    return Image.open(io.BytesIO(base64.b64decode(events(response)[-1]["png"])))
 
 def quota_count(uid="u1"):
     names = [n for n in BUCKET.store if n.startswith(f"quota/{uid}/")]
@@ -111,14 +121,30 @@ check("メールは小文字にそろえる", (uid, email) == ("u1", "friend@exa
 # --- 切り抜き ---
 reset()
 r = post("google")
-check("Google ログイン済みは 200 で PNG", r.status_code == 200 and r.headers["content-type"] == "image/png")
-out = Image.open(io.BytesIO(r.content))
+check("Google ログイン済みは 200 で NDJSON", r.status_code == 200 and r.headers["content-type"].startswith("application/x-ndjson"))
+phases = [e["phase"] for e in events(r)]
+check("工程が順に流れる", phases == ["received", "cutting", "finishing", "done"])
+check("推論中の行に見込み秒数が付く", isinstance(events(r)[1]["expectedSeconds"], (int, float)))
+out = result_png(r)
 check("透過 PNG で返る", out.mode == "RGBA")
 # 800×600 の中央 1/2（400×300）に 2% の余白を足した大きさに切り詰まる
 check("内容の周りで切り詰める", (400 <= out.width <= 420) and (300 <= out.height <= 315))
 alpha = np.asarray(out.getchannel("A"))
 check("中央は不透明、隅は透明", alpha[out.height // 2, out.width // 2] == 255 and alpha[0, 0] < 8)
 check("1 回数えた", quota_count() == 1)
+
+# --- Accept が無ければ PNG（配信済みの画面向け） ---
+reset()
+r = post("google", stream=False)
+check("Accept 無しは PNG で返る", r.status_code == 200 and r.headers["content-type"] == "image/png")
+check("PNG でも透過で切り詰まる", Image.open(io.BytesIO(r.content)).mode == "RGBA" and 400 <= Image.open(io.BytesIO(r.content)).width <= 420)
+with mock.patch.object(main, "_timed_predict_mask", side_effect=RuntimeError("boom")):
+    try:
+        post("google", stream=False)
+        check("PNG の形で推論に失敗したら 500", False)
+    except RuntimeError:
+        check("PNG の形で推論に失敗したら 500", True)
+check("PNG の形でも失敗は回数を戻す", quota_count() == 1)
 
 # --- 画像の検証 ---
 reset()
@@ -129,7 +155,7 @@ check("対応外の形式は 400", post("google", data=buf.getvalue()).status_co
 check("400 のときは回数を数えない", quota_count() == 0)
 big = Image.new("RGB", (3000, 2000)); buf = io.BytesIO(); big.save(buf, "JPEG", quality=95)
 r = post("google", data=buf.getvalue())
-out = Image.open(io.BytesIO(r.content))
+out = result_png(r)
 check("大きな写真は長辺 1024 に縮めてから切る", r.status_code == 200 and out.width <= 1024)
 
 # --- 回数 ---
@@ -139,12 +165,16 @@ check("3 回目は 429", post("google").status_code == 429)
 check("429 では回数が増えない", quota_count() == 2)
 
 reset()
-with mock.patch.object(main, "_cut_out", side_effect=RuntimeError("boom")):
-    try:
-        post("google")
-    except RuntimeError:
-        pass
+with mock.patch.object(main, "_timed_predict_mask", side_effect=RuntimeError("boom")):
+    r = post("google")
+check("推論の失敗は最後の行で failed", r.status_code == 200 and events(r)[-1]["phase"] == "failed")
 check("こちら都合の失敗は回数を戻す", quota_count() == 0)
+
+reset()
+main.RECENT_INFERENCE_SECONDS.clear()
+check("実測が無いうちは既定の見込み", main._expected_inference_seconds() == main.DEFAULT_INFERENCE_SECONDS)
+post("google")
+check("推論のたびに実測を覚える", len(main.RECENT_INFERENCE_SECONDS) == 1)
 
 reset()
 # 読んでから書くまでの間に別のリクエストが書いた → 409

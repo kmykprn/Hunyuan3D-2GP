@@ -11,12 +11,28 @@ POST {cutout_url}/cutouts
 Authorization: Bearer <Firebase ID トークン>
 Content-Type: multipart/form-data; image=<JPEG / PNG / WebP / HEIC, 5MB まで>
 
-200 image/png   … 切り抜き。透明な余白は切り落としてある（長辺 1024px まで）
+200 application/x-ndjson … Accept: application/x-ndjson を付けたとき。工程を 1 行ずつ流す（下記）
+200 image/png            … Accept を付けないとき。切り抜きだけを返す（古い画面向け。画面が流す形に切り替わったら消してよい）
 400             … 画像が読めない・対応外の形式・5MB 超。回数は数えない
 401             … トークンが無い・無効・Google に紐づいていない
 409             … 同時に処理された。やり直せばよい
 429             … 本日の上限（既定 50 枚）に達した
 ```
+
+### 200 の中身
+
+1 行 1 JSON。順に流れる。行が届くまでの空白が「起動待ち（コールドスタート）」なので、
+画面側はそれを区別して出せる。
+
+```
+{"phase":"received"}                       受け付けた（起動待ちが終わった）
+{"phase":"cutting","expectedSeconds":6.4}  推論中。直近 5 回の平均秒数。円の進み方の目安
+{"phase":"finishing"}                      余白の切り落としと PNG 化（0.3 秒）
+{"phase":"done","png":"<base64>"}          切り抜き。透明な余白は切り落としてある（長辺 1024px まで）
+{"phase":"failed","error":"…"}             推論中の失敗。done の代わりに来る。回数は戻す
+```
+
+推論そのものは途中経過を出せない（onnxruntime の中で止まる）ので、工程はこの 4 つまで。
 
 `GET /health` は `{"ok": true}`。
 
