@@ -50,6 +50,13 @@ MODEL_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
+# 推論に使うスレッド数。Terraform が CPU 数と同じ値を入れる。
+#
+# os.cpu_count() に頼らない。Cloud Run の第 2 世代コンテナではホストの CPU 数
+# （数十）が返り、4 vCPU の枠に対して過剰なスレッドを立てて逆に遅くなる
+# （実測: 手元 5 秒の推論が 33 秒になった）
+INFERENCE_THREADS = int(os.environ.get("INFERENCE_THREADS", "0")) or (os.cpu_count() or 1)
+
 # Content-Type ではなく、実際にデコードできた形式で判定する（api/main.py と同じ理由）
 ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP", "HEIF", "HEIC", "MPO"}
 
@@ -90,8 +97,10 @@ def _load_session() -> ort.InferenceSession:
     options = ort.SessionOptions()
     options.enable_cpu_mem_arena = False
     # 同時実行は 1（Cloud Run の設定）なので、CPU は全部この 1 件に使う
-    options.intra_op_num_threads = os.cpu_count() or 1
+    options.intra_op_num_threads = INFERENCE_THREADS
     options.inter_op_num_threads = 1
+    # 見立てを後から確かめられるように、環境が見せる CPU 数と実際に使う数を残す
+    print(f"inference threads={INFERENCE_THREADS} (os.cpu_count={os.cpu_count()})", flush=True)
     return ort.InferenceSession(MODEL_PATH, options, providers=["CPUExecutionProvider"])
 
 
