@@ -4,6 +4,8 @@ google-cloud-storage
 google-auth
 python-multipart
 firebase-admin
+# 楽天 API と商品画像の取得（google の依存で入るが、直接使うので明示する）
+requests
 pillow
 # iPhone が既定で送る HEIC/HEIF を Pillow で開けるようにする
 pillow-heif

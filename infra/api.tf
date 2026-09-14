@@ -140,6 +140,24 @@ resource "google_cloud_run_v2_service" "api" {
         value = join(",", var.allowed_origins)
       }
 
+      # 楽天の商品取り込み（variables.tf 参照）
+      env {
+        name  = "RAKUTEN_APPLICATION_ID"
+        value = var.rakuten_application_id
+      }
+      env {
+        name  = "RAKUTEN_ACCESS_KEY"
+        value = var.rakuten_access_key
+      }
+      env {
+        name  = "RAKUTEN_AFFILIATE_ID"
+        value = var.rakuten_affiliate_id
+      }
+      env {
+        name  = "PRODUCT_DAILY_LIMIT"
+        value = tostring(var.product_daily_limit)
+      }
+
       resources {
         limits = {
           cpu    = "1"

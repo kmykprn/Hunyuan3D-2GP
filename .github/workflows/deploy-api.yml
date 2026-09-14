@@ -42,6 +42,7 @@ jobs:
         run: |
           python test_queue.py
           python test_allowlist.py
+          python test_products.py
 
   deploy:
     needs: test
