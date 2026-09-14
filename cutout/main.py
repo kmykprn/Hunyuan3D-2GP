@@ -227,22 +227,18 @@ def _event(phase: str, **fields) -> bytes:
     return (json.dumps({"phase": phase, **fields}) + "\n").encode()
 
 
-async def _run_with_heartbeat(fn, *args, event):
-    """fn を別スレッドで走らせ、終わるまで HEARTBEAT_SECONDS ごとに event(経過秒) の行を流す。
+async def _heartbeat_until(task: asyncio.Future, event):
+    """task が終わるまで、HEARTBEAT_SECONDS ごとに event(経過秒) の行を流す。
 
     行を流すのは接続を黙らせないため。画面側は同じ工程の行が繰り返し来ても
-    円の基準時刻を動かさない（経過秒は行の中に入れて渡す）。
-    fn の結果は最後に yield する（bytes ではなく ("result", 値) の組）。
-    非同期ジェネレータは return で値を返せないので、この形にしている
+    円の基準時刻を動かさない（経過秒は行の中に入れて渡す）。結果は呼び出し側が task から取る
     """
-    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
     started = time.perf_counter()
     while True:
         finished, _ = await asyncio.wait({task}, timeout=HEARTBEAT_SECONDS)
         if finished:
-            break
+            return
         yield event(round(time.perf_counter() - started, 1))
-    yield ("result", task.result())
 
 
 # --- 入口 ---------------------------------------------------------------
@@ -308,22 +304,17 @@ async def create_cutout(
             yield _event("cutting", expectedSeconds=expected, elapsed=0)
             # 推論は数秒ブロックする。イベントループを止めないよう別スレッドで走らせ、
             # その間は同じ行を繰り返し流す（黙ると接続を閉じられることがある）
-            async for item in _run_with_heartbeat(
-                _timed_predict_mask, img,
-                event=lambda s: _event("cutting", expectedSeconds=expected, elapsed=s),
+            predicting = asyncio.ensure_future(asyncio.to_thread(_timed_predict_mask, img))
+            async for line in _heartbeat_until(
+                predicting, lambda s: _event("cutting", expectedSeconds=expected, elapsed=s)
             ):
-                if isinstance(item, tuple):
-                    mask = item[1]
-                else:
-                    yield item
+                yield line
+            mask = predicting.result()
             yield _event("finishing", elapsed=0)
-            async for item in _run_with_heartbeat(
-                _finish, img, mask, event=lambda s: _event("finishing", elapsed=s)
-            ):
-                if isinstance(item, tuple):
-                    png = item[1]
-                else:
-                    yield item
+            finishing = asyncio.ensure_future(asyncio.to_thread(_finish, img, mask))
+            async for line in _heartbeat_until(finishing, lambda s: _event("finishing", elapsed=s)):
+                yield line
+            png = finishing.result()
             yield _event("done", png=base64.b64encode(png).decode())
         except Exception as e:
             # こちら都合の失敗は回数に数えない
