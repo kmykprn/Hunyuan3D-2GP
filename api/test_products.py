@@ -68,6 +68,8 @@ check("末尾の / やクエリがあってもよい", rakuten.parse_item_url("h
 check("店名は小文字にそろえる", rakuten.parse_item_url("https://item.rakuten.co.jp/ShopX/ITEM/") == "shopx:ITEM")
 check("楽天以外は None", rakuten.parse_item_url("https://www.amazon.co.jp/dp/B0XXXX") is None)
 check("検索ページは None", rakuten.parse_item_url("https://search.rakuten.co.jp/search/mall/sofa/") is None)
+check("アフィリエイトのリンクは pc= の中の商品ページを見る", rakuten.parse_item_url("https://hb.afl.rakuten.co.jp/hgc/x.y.z.w/?pc=https%3A%2F%2Fitem.rakuten.co.jp%2Feeena%2Fg118032%2F&link_type=hybrid") == "eeena:g118032")
+check("itemCode から商品ページの URL を組む", rakuten.item_url("eeena:g118032") == "https://item.rakuten.co.jp/eeena/g118032/")
 
 # --- 寸法の抽出 ---
 m = rakuten.parse_dimensions
@@ -93,7 +95,19 @@ ITEM = {"itemName": "北欧ソファ 幅120cm 奥行80cm 高さ75cm", "itemPrice
 with mock.patch.object(rakuten.requests, "get", return_value=FakeResponse(200, {"Items": [{"Item": ITEM}]})) as g:
     p = rakuten.lookup("shop:x", "app", "key", "aff")
 check("旧い版（Item で包む）を読める", p["name"].startswith("北欧") and p["price"] == 24800 and p["size"] == {"w": 1.2, "h": 0.75, "d": 0.8})
-check("Referer にアプリのサイトを付ける", g.call_args.kwargs["headers"]["Referer"].startswith("https://kmykprn.github.io/"))
+check("管理番号をキーワードに店を絞って検索する", g.call_args.kwargs["params"]["keyword"] == "x" and g.call_args.kwargs["params"]["shopCode"] == "shop" and "itemCode" not in g.call_args.kwargs["params"])
+OTHER = {**ITEM, "itemUrl": "https://item.rakuten.co.jp/shop/other/"}
+AFF_ITEM = {**ITEM, "itemUrl": "https://hb.afl.rakuten.co.jp/hgc/a.b.c.d/?pc=https%3A%2F%2Fitem.rakuten.co.jp%2Fshop%2Fx%2F"}
+with mock.patch.object(rakuten.requests, "get", return_value=FakeResponse(200, {"Items": [OTHER, AFF_ITEM]})):
+    p = rakuten.lookup("shop:x", "app", "key", "aff")
+check("結果の中から商品ページが一致するものを選ぶ（紹介リンクの中も見る）", p["url"] == "https://item.rakuten.co.jp/shop/x/" and p["affiliateUrl"].startswith("https://hb.afl"))
+with mock.patch.object(rakuten.requests, "get", return_value=FakeResponse(200, {"Items": [OTHER]})):
+    try:
+        rakuten.lookup("shop:x", "app", "key", "aff"); check("一致する商品が無ければ 404", False)
+    except rakuten.RakutenError as e:
+        check("一致する商品が無ければ 404", e.status == 404)
+check("Origin と Referer にアプリのサイトを付ける", g.call_args.kwargs["headers"]["Origin"] == "https://kmykprn.github.io" and g.call_args.kwargs["headers"]["Referer"].startswith("https://kmykprn.github.io/"))
+check("商品ページの URL は itemCode から組む（紹介リンクにしない）", p["url"] == "https://item.rakuten.co.jp/shop/x/")
 with mock.patch.object(rakuten.requests, "get", return_value=FakeResponse(200, {"Items": [{**ITEM, "mediumImageUrls": ["https://shop.r10s.jp/a.jpg"]}]})):
     p = rakuten.lookup("shop:x", "app", "key", "aff")
 check("新しい版（そのまま・画像が文字列）を読める", p["imageUrl"] == "https://shop.r10s.jp/a.jpg" and p["affiliateUrl"].startswith("https://hb.afl"))

@@ -96,7 +96,7 @@ Content-Type: application/json
 | 502 | 楽天に繋がらない・応答が読めない・画像が取れない |
 | 503 | 楽天の ID が設定されていない（`rakuten_*` の Terraform 変数が空） |
 
-楽天市場商品検索 API（公式）に `itemCode` で問い合わせる。スクレイピングはしない。
+楽天市場商品検索 API（公式）に、URL の管理番号をキーワードにして店を絞って問い合わせ、商品ページの URL が一致する 1 件を選ぶ（URL の管理番号は API の itemCode とは別物で、itemCode 指定では引けない）。スクレイピングはしない。呼び出しにはアプリ登録の「許可するウェブサイト」に載せたサイトを Origin / Referer として付ける（無いと 403）。
 許可リスト（限定公開）はここでは見ない。回数は `quota/{uid}/{日付}-products.json` で数える。
 
 ### `GET /jobs/{jobId}`
