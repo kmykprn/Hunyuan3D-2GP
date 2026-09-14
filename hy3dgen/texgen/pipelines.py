@@ -39,9 +39,17 @@ class Hunyuan3DTexGenConfig:
         self.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
         self.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
         self.candidate_view_weights = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
+        # 環境変数で視点数と解像度を変えられるようにしてある。テクスチャ生成の
+        # 所要時間（1 件の約半分）と品質の釣り合いを実機で測るため（worker から渡る）。
+        #   TEXTURE_VIEWS=4 … 真上・真下の 2 視点を省く（家具は上下を見ない）
+        #   TEXTURE_SIZE   … 描画とテクスチャの一辺（既定 2048）
+        if os.environ.get('TEXTURE_VIEWS') == '4':
+            self.candidate_camera_azims = [0, 90, 180, 270]
+            self.candidate_camera_elevs = [0, 0, 0, 0]
+            self.candidate_view_weights = [1, 0.1, 0.5, 0.1]
 
-        self.render_size = 2048
-        self.texture_size = 2048
+        self.render_size = int(os.environ.get('TEXTURE_SIZE', '2048'))
+        self.texture_size = int(os.environ.get('TEXTURE_SIZE', '2048'))
         self.bake_exp = 4
         self.merge_method = 'fast'
 
@@ -189,9 +197,20 @@ class Hunyuan3DPaintPipeline:
 
         image_prompt = self.recenter_image(image_prompt)
 
+        # 各段の所要時間を出す。テクスチャ生成は 1 件の約半分を占めるので、どこが重いかを
+        # 実機のログで追えるようにしておく（標準出力。ワーカーが素通しする）
+        import time
+        stage_started = time.perf_counter()
+        def mark(stage):
+            nonlocal stage_started
+            print(f"[texgen] {stage}: {time.perf_counter() - stage_started:.1f}s", flush=True)
+            stage_started = time.perf_counter()
+
         image_prompt = self.models['delight_model'](image_prompt)
+        mark('delight')
 
         mesh = mesh_uv_wrap(mesh)
+        mark('uv_wrap')
 
         self.render.load_mesh(mesh)
 
@@ -206,7 +225,9 @@ class Hunyuan3DPaintPipeline:
         camera_info = [(((azim // 30) + 9) % 12) // {-20: 1, 0: 1, 20: 1, -90: 3, 90: 3}[
             elev] + {-20: 0, 0: 12, 20: 24, -90: 36, 90: 40}[elev] for azim, elev in
                        zip(selected_camera_azims, selected_camera_elevs)]
+        mark('render_maps')
         multiviews = self.models['multiview_model'](image_prompt, normal_maps + position_maps, camera_info)
+        mark('multiview_diffusion')
 
         for i in range(len(multiviews)):
             #     multiviews[i] = self.models['super_model'](multiviews[i])
@@ -217,11 +238,14 @@ class Hunyuan3DPaintPipeline:
                                                  selected_camera_elevs, selected_camera_azims, selected_view_weights,
                                                  method=self.config.merge_method)
 
+        mark('bake')
         mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
 
         texture = self.texture_inpaint(texture, mask_np)
+        mark('inpaint')
 
         self.render.set_texture(texture)
         textured_mesh = self.render.save_mesh()
+        mark('save_mesh')
 
         return textured_mesh

@@ -13,6 +13,7 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import cv2
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -811,13 +812,23 @@ class MeshRender():
         texture_np, mask = meshVerticeInpaint(
             texture_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
 
-        texture_np = cv2.inpaint(
-            (texture_np *
-             255).astype(
-                np.uint8),
-            255 -
-            mask,
-            3,
-            cv2.INPAINT_NS)
+        texture_u8 = (texture_np * 255).astype(np.uint8)
+        holes = 255 - mask
+
+        # cv2.inpaint は 2048² のテクスチャ全体（UV の外側の広い未使用領域を含む）に
+        # 対して走り、実測で 59 秒かかる（1 件の 1/4）。INPAINT_DOWNSCALE=n を渡すと、
+        # 1/n に縮めて補間してから元の大きさに戻し、**未描画の画素だけ**に書き戻す。
+        # 見えている画素はそのまま。埋める側はどのみち補間なので、粗くなっても目立たない
+        downscale = int(os.environ.get('INPAINT_DOWNSCALE', '1'))
+        if downscale > 1:
+            h, w = holes.shape[:2]
+            small = cv2.resize(texture_u8, (w // downscale, h // downscale), interpolation=cv2.INTER_AREA)
+            small_holes = cv2.resize(holes, (w // downscale, h // downscale), interpolation=cv2.INTER_NEAREST)
+            filled = cv2.inpaint(small, small_holes, 3, cv2.INPAINT_NS)
+            filled = cv2.resize(filled, (w, h), interpolation=cv2.INTER_LINEAR)
+            texture_u8 = np.where(holes[..., None] > 0, filled, texture_u8)
+            return texture_u8
+
+        texture_np = cv2.inpaint(texture_u8, holes, 3, cv2.INPAINT_NS)
 
         return texture_np
