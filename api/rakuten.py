@@ -6,6 +6,7 @@
 # ここには GCS も Firebase も無い。純粋な「URL → 商品情報」だけで、テストしやすくしてある。
 
 import io
+import os
 import re
 from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
@@ -14,6 +15,11 @@ from PIL import Image, UnidentifiedImageError
 
 # 楽天市場商品検索 API。2026 年版から accessKey が要る
 SEARCH_ENDPOINT = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701"
+
+# 楽天ウェブサービスのアプリ登録にある「許可するウェブサイト」に載せたサイト。
+# 「一覧に無いところからの呼び出しは拒否する」とあり、出どころは Referer で見られると
+# 考えられる。サーバーからの呼び出しには Referer が付かないので、自分で付ける
+APP_REFERER = os.environ.get("RAKUTEN_REFERER", "https://kmykprn.github.io/roomplanner-web/")
 
 # 商品ページの URL の形。shop と code は英数字・ハイフン・アンダースコア・ドット
 ITEM_URL = re.compile(r"^https?://item\.rakuten\.co\.jp/([a-z0-9][a-z0-9\-]*)/([A-Za-z0-9][A-Za-z0-9\-_.]*)/?", re.IGNORECASE)
@@ -117,7 +123,9 @@ def lookup(item_code: str, application_id: str, access_key: str, affiliate_id: s
     if affiliate_id:
         params["affiliateId"] = affiliate_id
     try:
-        response = requests.get(SEARCH_ENDPOINT, params=params, timeout=HTTP_TIMEOUT)
+        response = requests.get(
+            SEARCH_ENDPOINT, params=params, timeout=HTTP_TIMEOUT, headers={"Referer": APP_REFERER}
+        )
     except requests.RequestException as e:
         raise RakutenError(502, f"楽天に接続できない: {e}")
     if response.status_code == 429:

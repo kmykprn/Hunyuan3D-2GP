@@ -90,9 +90,10 @@ class FakeResponse:
     def json(self): return self._body
 ITEM = {"itemName": "北欧ソファ 幅120cm 奥行80cm 高さ75cm", "itemPrice": 24800, "shopName": "家具店", "itemUrl": "https://item.rakuten.co.jp/shop/x/",
         "affiliateUrl": "https://hb.afl.rakuten.co.jp/…", "mediumImageUrls": [{"imageUrl": "https://thumbnail.image.rakuten.co.jp/@0_mall/shop/a.jpg?_ex=128x128"}], "itemCaption": ""}
-with mock.patch.object(rakuten.requests, "get", return_value=FakeResponse(200, {"Items": [{"Item": ITEM}]})):
+with mock.patch.object(rakuten.requests, "get", return_value=FakeResponse(200, {"Items": [{"Item": ITEM}]})) as g:
     p = rakuten.lookup("shop:x", "app", "key", "aff")
 check("旧い版（Item で包む）を読める", p["name"].startswith("北欧") and p["price"] == 24800 and p["size"] == {"w": 1.2, "h": 0.75, "d": 0.8})
+check("Referer にアプリのサイトを付ける", g.call_args.kwargs["headers"]["Referer"].startswith("https://kmykprn.github.io/"))
 with mock.patch.object(rakuten.requests, "get", return_value=FakeResponse(200, {"Items": [{**ITEM, "mediumImageUrls": ["https://shop.r10s.jp/a.jpg"]}]})):
     p = rakuten.lookup("shop:x", "app", "key", "aff")
 check("新しい版（そのまま・画像が文字列）を読める", p["imageUrl"] == "https://shop.r10s.jp/a.jpg" and p["affiliateUrl"].startswith("https://hb.afl"))
