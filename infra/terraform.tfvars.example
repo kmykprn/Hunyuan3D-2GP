@@ -47,3 +47,9 @@ cutout_image = "asia-southeast1-docker.pkg.dev/your-project-id/hunyuan3d/cutout:
 # L4の初期割り当ては3枚だが、既定は障害対応用に1枚の余白を残す。
 max_running_jobs        = 2
 max_queued_jobs_per_uid = 5
+
+# 楽天の商品取り込み。楽天ウェブサービスとアフィリエイトで発行した値。
+# 空のままなら機能は閉じたまま（API が 503 を返す）
+rakuten_application_id = ""
+rakuten_access_key     = ""
+rakuten_affiliate_id   = ""

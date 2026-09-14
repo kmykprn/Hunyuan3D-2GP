@@ -181,3 +181,30 @@ variable "cutout_daily_limit" {
   type        = number
   default     = 50
 }
+
+# 楽天の商品取り込み（api/rakuten.py）。3 つとも楽天のサイトで発行し、terraform.tfvars に書く。
+# 空のままなら API は 503 を返して機能を閉じる。アクセスキーは秘密なので sensitive
+variable "rakuten_application_id" {
+  description = "楽天ウェブサービスのアプリ ID"
+  type        = string
+  default     = ""
+}
+
+variable "rakuten_access_key" {
+  description = "楽天ウェブサービスのアクセスキー（2026 年版の API で必須）。秘密"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "rakuten_affiliate_id" {
+  description = "楽天アフィリエイトの ID。商品リンクに紹介料が付く"
+  type        = string
+  default     = ""
+}
+
+variable "product_daily_limit" {
+  description = "楽天の商品取り込みの 1 人 1 日の上限"
+  type        = number
+  default     = 200
+}

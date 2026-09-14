@@ -7,6 +7,7 @@
 # 状態は GCS のファイルだけで持つ。書き込みは1ジョブ数回、読みは
 # ポーリングだけなので Firestore は要らない（SPEC.md 参照）。
 
+import base64
 import datetime
 import io
 import json
@@ -20,12 +21,15 @@ import google.auth
 import google.auth.transport.requests
 import pillow_heif
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.cloud import storage
 from google.oauth2 import id_token
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+import rakuten
 
 # iPhone が既定で送る HEIC/HEIF を Pillow で開けるようにする。
 # import しただけでは有効にならず、この登録が要る
@@ -98,6 +102,13 @@ ALLOWED_ORIGINS = [
 ]
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+# 楽天の商品取り込み。3 つとも Terraform の変数（sensitive）から入る。空なら機能を閉じる（503）
+RAKUTEN_APPLICATION_ID = os.environ.get("RAKUTEN_APPLICATION_ID", "")
+RAKUTEN_ACCESS_KEY = os.environ.get("RAKUTEN_ACCESS_KEY", "")
+RAKUTEN_AFFILIATE_ID = os.environ.get("RAKUTEN_AFFILIATE_ID", "")
+# 1 人 1 日の取り込み回数。楽天 API は無料だが叩き放題にはしない
+PRODUCT_DAILY_LIMIT = int(os.environ.get("PRODUCT_DAILY_LIMIT", "200"))
 
 # Content-Type ではなく、実際にデコードできた形式で判定する。
 # 拡張子や Content-Type は詐称できるうえ、実際に「PNG を名乗る壊れたファイル」が
@@ -688,10 +699,31 @@ def _dispatch_queued_jobs() -> None:
         _release_queue_space(claimed)
 
 
-def _quota_blob(uid: str):
-    """当日ぶんのカウンタ。日付が変わると別のファイルになり、自然に0から始まる。"""
+def _quota_blob(uid: str, kind: str = "jobs"):
+    """当日ぶんのカウンタ。日付が変わると別のファイルになり、自然に0から始まる。
+
+    kind は数える対象。生成（jobs）は従来どおりのファイル名、それ以外は末尾に付ける
+    """
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-    return _bucket().blob(f"quota/{uid}/{today}.json")
+    suffix = "" if kind == "jobs" else f"-{kind}"
+    return _bucket().blob(f"quota/{uid}/{today}{suffix}.json")
+
+
+def _consume_simple_quota(uid: str, kind: str, limit: int) -> None:
+    """生成以外の、成功・失敗を区別しない回数。上限なら 429、競合なら 409"""
+    blob = _quota_blob(uid, kind)
+    data, generation = _read_quota(blob)
+    count = data.get("count", 0)
+    if count >= limit:
+        raise HTTPException(status_code=429, detail=f"本日の上限（{limit}回）に達した")
+    try:
+        blob.upload_from_string(
+            json.dumps({"count": count + 1}),
+            content_type="application/json",
+            if_generation_match=generation,
+        )
+    except PreconditionFailed:
+        raise HTTPException(status_code=409, detail="同時に処理されたので、やり直してほしい")
 
 
 def _read_quota(blob) -> tuple[dict, int]:
@@ -932,6 +964,50 @@ async def create_job(
         raise
 
     return {"jobId": job_id}
+
+
+class ProductRequest(BaseModel):
+    url: str
+
+
+@app.post("/products")
+def import_product(body: ProductRequest, authorization: str | None = Header(default=None)):
+    """楽天の商品ページの URL から、商品情報と画像を返す。
+
+    画面はこの画像を切り抜きサービスに通して、寸法つきの家具として保管庫に入れる。
+    ここでは何も保存しない（商品画像をサーバーに残さない）。
+    """
+    uid, _email = _identity_from_token(authorization)
+    if not RAKUTEN_APPLICATION_ID or not RAKUTEN_ACCESS_KEY:
+        raise HTTPException(status_code=503, detail="商品の取り込みはまだ設定されていない")
+
+    item_code = rakuten.parse_item_url(body.url)
+    if not item_code:
+        raise HTTPException(
+            status_code=400,
+            detail="楽天市場の商品ページ（item.rakuten.co.jp/…）の URL を貼ってほしい",
+        )
+    # 楽天に問い合わせる前に数える。読めない URL は上で弾いているので、数えるのは実際に問い合わせる分だけ
+    _consume_simple_quota(uid, "products", PRODUCT_DAILY_LIMIT)
+
+    try:
+        product = rakuten.lookup(item_code, RAKUTEN_APPLICATION_ID, RAKUTEN_ACCESS_KEY, RAKUTEN_AFFILIATE_ID)
+        if not product["imageUrl"]:
+            raise rakuten.RakutenError(404, "この商品には画像が無い")
+        image, mime = rakuten.fetch_image(product["imageUrl"])
+    except rakuten.RakutenError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+
+    return {
+        "name": product["name"],
+        "price": product["price"],
+        "shop": product["shop"],
+        "url": product["url"],
+        "affiliateUrl": product["affiliateUrl"],
+        "size": product["size"],
+        "imageType": mime,
+        "imageBase64": base64.b64encode(image).decode(),
+    }
 
 
 @app.get("/jobs/{job_id}")

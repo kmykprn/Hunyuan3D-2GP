@@ -13,7 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY main.py .
+COPY main.py rakuten.py .
 
 # Cloud Run は $PORT で待ち受けることを要求する。
 # 既定の 8080 を入れておき、環境変数があればそちらに従う

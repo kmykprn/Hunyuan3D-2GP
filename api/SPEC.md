@@ -68,6 +68,37 @@ GPU の同時実行数はプロジェクト全体で `max_running_jobs`（既定
 `max_running_jobs` 本しかなく、塞がると誰も生成できないため、execution の死活まで
 確かめて解放する。目印の取り残しも、数えるついでに掃除する。
 
+### `POST /products`
+
+楽天市場の商品ページの URL から、商品情報と画像を返す。画面はこの画像を切り抜きに通して、
+寸法つきの家具として保管庫に入れる。サーバーは何も保存しない。
+
+```
+Authorization: Bearer <Firebase ID トークン>
+Content-Type: application/json
+{ "url": "https://item.rakuten.co.jp/{shop}/{code}/" }
+
+→ 200 {
+    "name": "北欧ソファ …", "price": 24800, "shop": "家具店",
+    "url": "https://item.rakuten.co.jp/…",           // 商品ページ
+    "affiliateUrl": "https://hb.afl.rakuten.co.jp/…", // 紹介料の付くリンク。画面はこちらを開く
+    "size": { "w": 1.2, "h": 0.75, "d": 0.8 } | null,  // m。商品名・説明から拾えたときだけ
+    "imageType": "image/jpeg", "imageBase64": "…"      // 商品画像（長辺 1024px まで）
+  }
+```
+
+| 状態 | 意味 |
+|---|---|
+| 400 | 楽天市場の商品ページの URL でない（`item.rakuten.co.jp/…` だけに対応） |
+| 401 | トークンが無効 |
+| 404 | 商品が見つからない（販売終了・URL 違い）、または画像が無い |
+| 429 | 本日の上限（`product_daily_limit`、既定 200）か、楽天側が混み合っている |
+| 502 | 楽天に繋がらない・応答が読めない・画像が取れない |
+| 503 | 楽天の ID が設定されていない（`rakuten_*` の Terraform 変数が空） |
+
+楽天市場商品検索 API（公式）に `itemCode` で問い合わせる。スクレイピングはしない。
+許可リスト（限定公開）はここでは見ない。回数は `quota/{uid}/{日付}-products.json` で数える。
+
 ### `GET /jobs/{jobId}`
 
 ```
