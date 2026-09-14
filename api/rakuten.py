@@ -8,7 +8,7 @@
 import io
 import os
 import re
-from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
+from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse, unquote
 
 import requests
 from PIL import Image, UnidentifiedImageError
@@ -17,12 +17,17 @@ from PIL import Image, UnidentifiedImageError
 SEARCH_ENDPOINT = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701"
 
 # 楽天ウェブサービスのアプリ登録にある「許可するウェブサイト」に載せたサイト。
-# 「一覧に無いところからの呼び出しは拒否する」とあり、出どころは Referer で見られると
-# 考えられる。サーバーからの呼び出しには Referer が付かないので、自分で付ける
+# 「一覧に無いところからの呼び出しは拒否する」とあり、実測では **Origin ヘッダ**で見ている
+# （Referer だけだと REQUEST_CONTEXT_BODY_HTTP_REFERRER_MISSING で 403）。
+# サーバーからの呼び出しにはどちらも付かないので、自分で付ける
 APP_REFERER = os.environ.get("RAKUTEN_REFERER", "https://kmykprn.github.io/roomplanner-web/")
+APP_ORIGIN = "{0.scheme}://{0.netloc}".format(urlparse(APP_REFERER))
+API_HEADERS = {"Origin": APP_ORIGIN, "Referer": APP_REFERER}
 
 # 商品ページの URL の形。shop と code は英数字・ハイフン・アンダースコア・ドット
 ITEM_URL = re.compile(r"^https?://item\.rakuten\.co\.jp/([a-z0-9][a-z0-9\-]*)/([A-Za-z0-9][A-Za-z0-9\-_.]*)/?", re.IGNORECASE)
+# アフィリエイトのリンク（共有ボタンで出てくる形）。本当の商品ページは pc= の中にある
+AFFILIATE_URL = re.compile(r"^https?://hb\.afl\.rakuten\.co\.jp/", re.IGNORECASE)
 
 # 画像を取ってよいホスト。楽天の商品画像 CDN だけ（SSRF を防ぐ）
 IMAGE_HOSTS = ("thumbnail.image.rakuten.co.jp", "image.rakuten.co.jp", "shop.r10s.jp", "tshop.r10s.jp")
@@ -34,12 +39,25 @@ HTTP_TIMEOUT = 10
 
 
 def parse_item_url(url: str) -> str | None:
-    """商品ページの URL から API の itemCode（"shop:code"）を作る。楽天の商品ページでなければ None"""
-    match = ITEM_URL.match(url.strip())
+    """商品ページの URL から API の itemCode（"shop:code"）を作る。楽天の商品ページでなければ None
+
+    アフィリエイトのリンク（hb.afl.rakuten.co.jp/…?pc=商品ページ）を貼られたときは中の商品ページを見る
+    """
+    url = url.strip()
+    if AFFILIATE_URL.match(url):
+        inner = dict(parse_qsl(urlparse(url).query)).get("pc", "")
+        url = unquote(inner)
+    match = ITEM_URL.match(url)
     if not match:
         return None
     shop, code = match.group(1).lower(), match.group(2)
     return f"{shop}:{code}"
+
+
+def item_url(item_code: str) -> str:
+    """itemCode から商品ページの URL を組む。API の itemUrl は affiliateId を付けると紹介リンクになるため"""
+    shop, code = item_code.split(":", 1)
+    return f"https://item.rakuten.co.jp/{shop}/{code}/"
 
 
 def large_image_url(url: str) -> str:
@@ -112,20 +130,25 @@ class RakutenError(Exception):
 
 
 def lookup(item_code: str, application_id: str, access_key: str, affiliate_id: str) -> dict:
-    """商品検索 API に itemCode で問い合わせ、1 件の商品情報を返す。"""
+    """商品検索 API に問い合わせ、その商品ページの 1 件を返す。
+
+    URL にある "shop/管理番号" は API の itemCode（shop:数字の ID）とは別物で、itemCode 指定では
+    引けない（実測: itemCode is not valid）。管理番号をキーワードに店を絞って検索し、
+    結果の中から商品ページの URL が一致するものを選ぶ
+    """
+    shop, slug = item_code.split(":", 1)
     params = {
         "format": "json",
-        "itemCode": item_code,
+        "keyword": slug,
+        "shopCode": shop,
         "applicationId": application_id,
         "accessKey": access_key,
-        "hits": 1,
+        "hits": 10,
     }
     if affiliate_id:
         params["affiliateId"] = affiliate_id
     try:
-        response = requests.get(
-            SEARCH_ENDPOINT, params=params, timeout=HTTP_TIMEOUT, headers={"Referer": APP_REFERER}
-        )
+        response = requests.get(SEARCH_ENDPOINT, params=params, timeout=HTTP_TIMEOUT, headers=API_HEADERS)
     except requests.RequestException as e:
         raise RakutenError(502, f"楽天に接続できない: {e}")
     if response.status_code == 429:
@@ -133,13 +156,14 @@ def lookup(item_code: str, application_id: str, access_key: str, affiliate_id: s
     if response.status_code != 200:
         raise RakutenError(502, f"楽天の応答が {response.status_code}")
     body = response.json()
-    items = body.get("Items") or []
-    if not items:
-        raise RakutenError(404, "その商品が見つからない（販売終了か、URL が違う）")
-    item = items[0]
     # 古い版は {"Item": {...}} で包んでいる。新しい版はそのまま
-    if "Item" in item and isinstance(item["Item"], dict):
-        item = item["Item"]
+    items = [it["Item"] if isinstance(it.get("Item"), dict) else it for it in (body.get("Items") or [])]
+    # affiliateId を付けると itemUrl は紹介リンク（pc= の中に商品ページ）になるので、戻してから比べる
+    wanted = f"/{shop}/{slug}".lower()
+    matches = [it for it in items if wanted in unquote(it.get("itemUrl", "")).lower()]
+    if not matches:
+        raise RakutenError(404, "その商品が見つからない（販売終了か、URL が違う）")
+    item = matches[0]
     images = item.get("mediumImageUrls") or []
     image_url = None
     if images:
@@ -149,7 +173,8 @@ def lookup(item_code: str, application_id: str, access_key: str, affiliate_id: s
         "name": item.get("itemName", ""),
         "price": item.get("itemPrice"),
         "shop": item.get("shopName", ""),
-        "url": item.get("itemUrl", ""),
+        # affiliateId を付けると itemUrl まで紹介リンクになるので、商品ページは itemCode から組む
+        "url": item_url(item_code),
         "affiliateUrl": item.get("affiliateUrl") or item.get("itemUrl", ""),
         "imageUrl": image_url,
         "size": parse_dimensions(f"{item.get('itemName', '')}\n{item.get('itemCaption', '')}"),
