@@ -25,14 +25,20 @@ Content-Type: multipart/form-data; image=<JPEG / PNG / WebP / HEIC, 5MB まで>
 画面側はそれを区別して出せる。
 
 ```
-{"phase":"received"}                       受け付けた（起動待ちが終わった）
-{"phase":"cutting","expectedSeconds":6.4}  推論中。直近 5 回の平均秒数。円の進み方の目安
-{"phase":"finishing"}                      余白の切り落としと PNG 化（0.3 秒）
-{"phase":"done","png":"<base64>"}          切り抜き。透明な余白は切り落としてある（長辺 1024px まで）
-{"phase":"failed","error":"…"}             推論中の失敗。done の代わりに来る。回数は戻す
+{"phase":"received"}                                   受け付けた（起動待ちが終わった）
+{"phase":"cutting","expectedSeconds":6.4,"elapsed":0}  推論中。expectedSeconds は直近 5 回の平均秒数。円の進み方の目安
+{"phase":"cutting","expectedSeconds":6.4,"elapsed":2}  同じ行を 2 秒ごとに繰り返す（elapsed は工程に入ってからの秒数）
+{"phase":"finishing","elapsed":0}                      余白の切り落としと PNG 化（0.3 秒）。長引けば同様に繰り返す
+{"phase":"done","png":"<base64>"}                      切り抜き。透明な余白は切り落としてある（長辺 1024px まで）
+{"phase":"failed","error":"…"}                         推論中の失敗。done の代わりに来る。回数は戻す
 ```
 
 推論そのものは途中経過を出せない（onnxruntime の中で止まる）ので、工程はこの 4 つまで。
+
+同じ工程の行を繰り返すのは、接続を黙らせないため。ヘッダを送ったあと 20 秒ほど無通信が続くと、
+途中の経路が応答を閉じてしまい、画面には done が届かないことがあった（iPhone、HTTP/3）。
+画面側は工程が変わったときだけ円の基準時刻を動かし、繰り返しの行では動かさない。
+間隔は環境変数 HEARTBEAT_SECONDS（既定 2）。
 
 `GET /health` は `{"ok": true}`。
 
