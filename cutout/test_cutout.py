@@ -133,6 +133,19 @@ alpha = np.asarray(out.getchannel("A"))
 check("中央は不透明、隅は透明", alpha[out.height // 2, out.width // 2] == 255 and alpha[0, 0] < 8)
 check("1 回数えた", quota_count() == 1)
 
+# 推論が長いあいだは、同じ工程の行を繰り返し流す（接続を黙らせない）
+import time as _time
+def slow_predict(img):
+    _time.sleep(0.35)
+    return main.predict_mask(main._session, img)
+with mock.patch.object(main, "HEARTBEAT_SECONDS", 0.1), mock.patch.object(main, "_timed_predict_mask", side_effect=slow_predict):
+    reset()
+    beats = events(post("google"))
+cutting = [e for e in beats if e["phase"] == "cutting"]
+check("推論中は行を繰り返し流す", len(cutting) >= 3)
+check("繰り返す行に経過秒が増えていく", [e["elapsed"] for e in cutting] == sorted(e["elapsed"] for e in cutting) and cutting[-1]["elapsed"] > 0)
+check("繰り返しても工程の順は変わらない", [p for p in (e["phase"] for e in beats) if p != "cutting"] == ["received", "finishing", "done"])
+
 # --- Accept が無ければ PNG（配信済みの画面向け） ---
 reset()
 r = post("google", stream=False)
