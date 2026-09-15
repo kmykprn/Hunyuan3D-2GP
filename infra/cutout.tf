@@ -29,10 +29,10 @@ resource "google_storage_bucket" "cutout_state" {
     action { type = "Delete" }
   }
 
-  # 預かった切り抜きは、画面が取りに来たら用済み。閉じたまま 2 日放置されたら諦める
+  # 預かった切り抜きは、画面が取りに来たら用済み。閉じたまま 1 日放置されたら諦める
   lifecycle_rule {
     condition {
-      age            = 2
+      age            = 1
       matches_prefix = ["jobs/"]
     }
     action { type = "Delete" }
