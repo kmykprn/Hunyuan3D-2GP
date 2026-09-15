@@ -25,7 +25,7 @@ GET {cutout_url}/cutout-jobs/{id}
 Authorization: Bearer <Firebase ID トークン>
 
 200 {"phase": "queued" | "running" | "done" | "failed", "expectedSeconds": 6.4, "elapsed": 3.2, "error": null}
-404 … 無い・他人のもの・消えた（7 日）
+404 … 無い・他人のもの・消えた（2 日）
 
 GET {cutout_url}/cutout-jobs/{id}/result
 200 image/png … 透明な余白は切り落としてある（長辺 1024px まで）
@@ -45,44 +45,9 @@ running は処理開始から）。端末の時計とずれても円の進み方
    台数の上限（429/503）や処理中の消滅は Cloud Tasks が再試行する。done / failed なら何もしない
 3. `/run` は Cloud Tasks が付ける OIDC トークン（サービスアカウント、audience はサービスの URL）を検証し、
    それ以外は 403。環境変数 `TASK_QUEUE` / `SELF_URL` / `TASK_SERVICE_ACCOUNT` は Terraform（infra/cutout.tf）が入れる
-
-### 旧: 1 本の接続で待つ形（消してよい）
-
-画面が `/cutout-jobs` に切り替わったら消す。
-
-```
-POST {cutout_url}/cutouts
-Authorization: Bearer <Firebase ID トークン>
-Content-Type: multipart/form-data; image=<JPEG / PNG / WebP / HEIC, 5MB まで>
-
-200 application/x-ndjson … Accept: application/x-ndjson を付けたとき。工程を 1 行ずつ流す（下記）
-200 image/png            … Accept を付けないとき。切り抜きだけを返す（古い画面向け。画面が流す形に切り替わったら消してよい）
-400             … 画像が読めない・対応外の形式・5MB 超。回数は数えない
-401             … トークンが無い・無効・Google に紐づいていない
-409             … 同時に処理された。やり直せばよい
-429             … 本日の上限（既定 50 枚）に達した
-```
-
-### 200 の中身
-
-1 行 1 JSON。順に流れる。行が届くまでの空白が「起動待ち（コールドスタート）」なので、
-画面側はそれを区別して出せる。
-
-```
-{"phase":"received"}                                   受け付けた（起動待ちが終わった）
-{"phase":"cutting","expectedSeconds":6.4,"elapsed":0}  推論中。expectedSeconds は直近 5 回の平均秒数。円の進み方の目安
-{"phase":"cutting","expectedSeconds":6.4,"elapsed":2}  同じ行を 2 秒ごとに繰り返す（elapsed は工程に入ってからの秒数）
-{"phase":"finishing","elapsed":0}                      余白の切り落としと PNG 化（0.3 秒）。長引けば同様に繰り返す
-{"phase":"done","png":"<base64>"}                      切り抜き。透明な余白は切り落としてある（長辺 1024px まで）
-{"phase":"failed","error":"…"}                         推論中の失敗。done の代わりに来る。回数は戻す
-```
-
-推論そのものは途中経過を出せない（onnxruntime の中で止まる）ので、工程はこの 4 つまで。
-
-同じ工程の行を繰り返すのは、接続を黙らせないため。ヘッダを送ったあと 20 秒ほど無通信が続くと、
-途中の経路が応答を閉じてしまい、画面には done が届かないことがあった（iPhone、HTTP/3）。
-画面側は工程が変わったときだけ円の基準時刻を動かし、繰り返しの行では動かさない。
-間隔は環境変数 HEARTBEAT_SECONDS（既定 2）。
+4. 推論は 1 台で同時に 1 つ（6.4GB）。`/run` が重なれば 429 を返し、Cloud Tasks が数秒後に再試行する。
+   サービスの同時リクエスト数は 8 で、状態確認の GET は推論中の台が合間に返す
+   （1 にすると GET のために 2 台目が起動し、起動 20 秒ぶんの費用がかかる）
 
 `GET /health` は `{"ok": true}`。
 
