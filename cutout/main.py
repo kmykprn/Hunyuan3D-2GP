@@ -419,14 +419,39 @@ async def run_cutout_job(
         _inference_slot.release()
 
 
+# 状態確認で待ってもらえる上限（秒）。サービスの打ち切り 60 秒より十分短く
+MAX_WAIT_SECONDS = 25.0
+# 待っている間に状態を読み直す間隔（秒）。GCS の小さな読み取りなので費用は無視できる
+WAIT_POLL_SECONDS = 1.0
+
+
 @app.get("/cutout-jobs/{job_id}")
-def get_cutout_job(job_id: str, authorization: str | None = Header(default=None)):
-    """預けた 1 件の状態。自分の分しか見えない（uid はトークンから）。"""
+async def get_cutout_job(
+    job_id: str,
+    wait: float = 0,
+    after: str | None = None,
+    authorization: str | None = Header(default=None),
+):
+    """預けた 1 件の状態。自分の分しか見えない（uid はトークンから）。
+
+    wait を付けると、工程が after から変わる（または done / failed になる）まで最大
+    wait 秒（上限 25）サーバーで待ってから返す。画面が 2 秒ごとに叩く代わりに、
+    「起動待ち → 推論中 → 完成」の変わり目ごとに 1 回で済む。
+    待っている途中で画面が裏に回って接続が切れても、状態は GCS にあるので、
+    戻ってきてもう一度叩けばよい
+    """
     uid, _email = _identity_from_token(authorization)
-    status = _read_status(uid, job_id)
-    if status is None:
-        raise HTTPException(status_code=404, detail="預かりが無い")
-    return _public_status(status)
+    deadline = time.monotonic() + min(max(wait, 0.0), MAX_WAIT_SECONDS)
+    while True:
+        status = _read_status(uid, job_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="預かりが無い")
+        phase = status["phase"]
+        settled = phase in ("done", "failed")
+        changed = after is not None and phase != after
+        if settled or changed or time.monotonic() >= deadline:
+            return _public_status(status)
+        await asyncio.sleep(min(WAIT_POLL_SECONDS, max(deadline - time.monotonic(), 0.0)))
 
 
 @app.get("/cutout-jobs/{job_id}/result")
