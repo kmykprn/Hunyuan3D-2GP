@@ -29,7 +29,13 @@ class FakeBlob:
     def exists(self): return self._rec is not None
     def reload(self):
         if not self._rec: raise NotFound(self.name)
-    def download_as_text(self): return self._rec["data"]
+    def download_as_text(self):
+        if not self._rec: raise NotFound(self.name)
+        return self._rec["data"]
+    def download_as_bytes(self):
+        if not self._rec: raise NotFound(self.name)
+        data = self._rec["data"]
+        return data if isinstance(data, bytes) else data.encode()
     def upload_from_string(self, data, content_type=None, if_generation_match=None):
         cur = self._rec
         if if_generation_match is not None:
@@ -70,6 +76,7 @@ client = TestClient(app=main.app)
 # トークンの検証を偽物にする。値は (uid, email, email_verified)
 TOKENS = {
     "google": {"uid": "u1", "email": "Friend@Example.com", "email_verified": True},
+    "google2": {"uid": "u9", "email": "other@example.com", "email_verified": True},
     "unverified": {"uid": "u2", "email": "x@example.com", "email_verified": False},
     "anon": {"uid": "u3"},
 }
@@ -202,6 +209,71 @@ with mock.patch.object(main, "_read_quota", racy_read):
         check("競合は 409", False)
     except HTTPException as e:
         check("競合は 409", e.status_code == 409)
+
+# --- 預ける形（/cutout-jobs） ---
+class FakeTasks:
+    """積まれた処理を覚えるだけ。実行はテストが /run を叩いて行う"""
+    def __init__(self): self.tasks = []
+    def create_task(self, parent, task): self.tasks.append((parent, task))
+
+def job_headers(token="google"):
+    return {"Authorization": f"Bearer {token}"}
+
+def post_job(token="google", data=png_bytes()):
+    return client.post("/cutout-jobs", files={"image": ("photo.png", data, "image/png")}, headers=job_headers(token))
+
+def run_job(uid, job_id, token="task"):
+    return client.post(f"/cutout-jobs/{uid}/{job_id}/run", headers=job_headers(token))
+
+def fake_verify_task(authorization):
+    if authorization != "Bearer task": raise HTTPException(status_code=403, detail="内部の入口")
+
+reset()
+check("預かる設定が無ければ 503", post_job().status_code == 503)
+check("503 では回数を数えない", quota_count() == 0)
+
+fake_tasks = FakeTasks()
+with mock.patch.object(main, "_tasks", fake_tasks), \
+     mock.patch.object(main, "SELF_URL", "https://cutout.example"), \
+     mock.patch.object(main, "TASK_SERVICE_ACCOUNT", "cutout@example.iam"), \
+     mock.patch.object(main, "_verify_task_token", fake_verify_task):
+    reset()
+    check("預ける入口もヘッダ無しは 401", post_job(token=None).status_code == 401)
+    r = post_job()
+    check("預けると 202 で受付番号と見込み秒数", r.status_code == 202 and "id" in r.json() and isinstance(r.json()["expectedSeconds"], (int, float)))
+    job_id = r.json()["id"]
+    check("預けた時点で 1 回数える", quota_count() == 1)
+    check("Cloud Tasks に /run が積まれる", len(fake_tasks.tasks) == 1 and fake_tasks.tasks[0][1]["http_request"]["url"] == f"https://cutout.example/cutout-jobs/u1/{job_id}/run")
+    check("積む処理はサービスアカウントの OIDC トークン付き", fake_tasks.tasks[0][1]["http_request"]["oidc_token"]["service_account_email"] == "cutout@example.iam")
+    check("入力の JPEG が置かれる", f"jobs/u1/{job_id}/input.jpg" in BUCKET.store)
+    st = client.get(f"/cutout-jobs/{job_id}", headers=job_headers()).json()
+    check("預けた直後は queued", st["phase"] == "queued" and st["expectedSeconds"] is not None)
+    check("他人の受付番号は 404", client.get(f"/cutout-jobs/{job_id}", headers=job_headers("google2")).status_code == 404)
+    check("できる前の結果は 404", client.get(f"/cutout-jobs/{job_id}/result", headers=job_headers()).status_code == 404)
+    check("/run はトークン無しでは 403", run_job("u1", job_id, token="bogus").status_code == 403)
+    check("/run は無い受付番号なら 404", run_job("u1", "nope").status_code == 404)
+    r = run_job("u1", job_id)
+    check("/run で処理して done", r.status_code == 200 and r.json()["phase"] == "done")
+    st = client.get(f"/cutout-jobs/{job_id}", headers=job_headers()).json()
+    check("状態が done になる", st["phase"] == "done")
+    out = Image.open(io.BytesIO(client.get(f"/cutout-jobs/{job_id}/result", headers=job_headers()).content))
+    check("結果は透過 PNG で切り詰まっている", out.mode == "RGBA" and 400 <= out.width <= 420)
+    check("done のあと /run が再び来ても処理しない", run_job("u1", job_id).json()["phase"] == "done")
+
+    reset(); fake_tasks.tasks.clear()
+    job_id = post_job().json()["id"]
+    with mock.patch.object(main, "_timed_predict_mask", side_effect=RuntimeError("boom")):
+        r = run_job("u1", job_id)
+    check("推論に失敗したら failed で 200（再試行させない）", r.status_code == 200 and r.json()["phase"] == "failed")
+    st = client.get(f"/cutout-jobs/{job_id}", headers=job_headers()).json()
+    check("failed の理由が読める", st["phase"] == "failed" and "切り抜きに失敗" in st["error"])
+    check("失敗は回数を戻す", quota_count() == 0)
+
+    reset(); fake_tasks.tasks.clear()
+    with mock.patch.object(fake_tasks, "create_task", side_effect=RuntimeError("queue down")):
+        r = post_job()
+    check("積めなければ 503", r.status_code == 503)
+    check("積めなかった分は回数を戻す", quota_count() == 0)
 
 # --- 切り詰め ---
 empty = Image.new("RGBA", (50, 40), (0, 0, 0, 0))

@@ -8,3 +8,5 @@ numpy
 pillow
 # iPhone が既定で送る HEIC/HEIF を Pillow で開けるようにする
 pillow-heif
+# 預かった切り抜きの処理を積む（/cutout-jobs）
+google-cloud-tasks

@@ -5,7 +5,13 @@
 # 512Mi と 12Gi で桁違いなので、同じコンテナに同居させると受付側まで
 # 太くなる。3D をやめることになっても、こちらは単独で残せる。
 #
-# 状態は 1 日の回数だけ。GCS のファイルで数える（api/main.py と同じ作り）。
+# 状態は GCS のファイル。1 日の回数（quota/）と、預かった切り抜き（jobs/）。
+#
+# 切り抜きは「預けて、あとで取りに行く」形（/cutout-jobs）。受け付けたら入力を GCS に
+# 置き、Cloud Tasks に「この 1 件を処理せよ」を積んで、すぐ受付番号を返す。処理は
+# Cloud Tasks がこのサービス自身の /run を叩いて行う（別のリクエストなので CPU が付く）。
+# 画面は受付番号で状態を見に来る。iPhone は PWA を裏に回すと数秒で通信を切るので、
+# 1 本の接続で 30〜50 秒待たせる形（旧 /cutouts）は、URL をコピーしに行く間に切れていた。
 
 import asyncio
 import base64
@@ -15,6 +21,7 @@ import io
 import json
 import os
 import time
+import uuid
 
 import firebase_admin
 import pillow_heif
@@ -22,8 +29,10 @@ from fastapi import FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth as fb_auth
-from google.api_core.exceptions import PreconditionFailed
-from google.cloud import storage
+from google.api_core.exceptions import NotFound, PreconditionFailed
+from google.auth.transport import requests as google_requests
+from google.cloud import storage, tasks_v2
+from google.oauth2 import id_token as google_id_token
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from birefnet import crop_to_content, load_session, predict_mask, to_png
@@ -44,6 +53,16 @@ DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()
 ]
+
+# 預かった切り抜きを処理する順番待ち（Cloud Tasks の queue、projects/…/queues/…）と、
+# その処理がこのサービス自身を叩くときの URL・名乗るサービスアカウント。
+# Terraform（infra/cutout.tf）が入れる。空なら /cutout-jobs は 503 で閉じる
+TASK_QUEUE = os.environ.get("TASK_QUEUE", "")
+SELF_URL = os.environ.get("SELF_URL", "").rstrip("/")
+TASK_SERVICE_ACCOUNT = os.environ.get("TASK_SERVICE_ACCOUNT", "")
+
+# 預かった入力の JPEG 品質。長辺 1024 に縮めてから置くので 200KB 前後
+INPUT_JPEG_QUALITY = 92
 
 # モデルの重み。Dockerfile がイメージに焼く（md5 で検証済み）。
 # BiRefNet-general-lite（MIT）。前処理・後処理は birefnet.py
@@ -89,6 +108,7 @@ app.add_middleware(
 
 firebase_admin.initialize_app()
 _storage = storage.Client()
+_tasks = tasks_v2.CloudTasksClient() if TASK_QUEUE else None
 
 
 _session = load_session(MODEL_PATH, INFERENCE_THREADS)
@@ -322,3 +342,186 @@ async def create_cutout(
             yield _event("failed", error=f"切り抜きに失敗: {e}")
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# --- 預ける形（/cutout-jobs） ------------------------------------------------
+#
+# jobs/{uid}/{id}/input.jpg   受け付けた写真（長辺 1024 に縮め、向きを直した JPEG）
+# jobs/{uid}/{id}/status.json {"phase": queued|running|done|failed, ...}
+# jobs/{uid}/{id}/result.png  切り抜き（done のとき）
+#
+# uid をパスに含めるのは、状態を見に来た人が自分の分しか読めないようにするため
+# （トークンの uid から組み立てる）。古いものはバケットのライフサイクルで消える。
+
+
+def _job_blob(uid: str, job_id: str, name: str):
+    return _storage.bucket(STATE_BUCKET).blob(f"jobs/{uid}/{job_id}/{name}")
+
+
+def _read_status(uid: str, job_id: str) -> dict | None:
+    blob = _job_blob(uid, job_id, "status.json")
+    try:
+        return json.loads(blob.download_as_text())
+    except NotFound:
+        return None
+
+
+def _write_status(uid: str, job_id: str, status: dict) -> None:
+    _job_blob(uid, job_id, "status.json").upload_from_string(
+        json.dumps(status), content_type="application/json"
+    )
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _enqueue_run(uid: str, job_id: str) -> None:
+    """Cloud Tasks に「この 1 件を処理せよ」を積む。
+
+    処理はこのサービス自身の /run を、サービスアカウントの OIDC トークン付きで叩く。
+    /run 側はそのトークンを検証して、Cloud Tasks 以外からの呼び出しを 403 で弾く
+    """
+    _tasks.create_task(
+        parent=TASK_QUEUE,
+        task={
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": f"{SELF_URL}/cutout-jobs/{uid}/{job_id}/run",
+                "oidc_token": {
+                    "service_account_email": TASK_SERVICE_ACCOUNT,
+                    "audience": SELF_URL,
+                },
+            }
+        },
+    )
+
+
+def _verify_task_token(authorization: str | None) -> None:
+    """/run を叩いてきたのが Cloud Tasks（自分のサービスアカウント）か確かめる。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=403, detail="内部の入口")
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            authorization[len("Bearer "):], google_requests.Request(), audience=SELF_URL
+        )
+    except Exception as e:
+        raise HTTPException(status_code=403, detail=f"トークンが無効: {e}")
+    if not claims.get("email_verified") or claims.get("email") != TASK_SERVICE_ACCOUNT:
+        raise HTTPException(status_code=403, detail="内部の入口")
+
+
+def _public_status(status: dict) -> dict:
+    """画面に返す形。経過秒はこちらの時計で出す（端末の時計とずれても困らないように）。"""
+    now = _now()
+    phase = status["phase"]
+    if phase == "running":
+        elapsed = now - status.get("startedAt", now)
+    elif phase == "queued":
+        elapsed = now - status.get("createdAt", now)
+    else:
+        elapsed = 0.0
+    return {
+        "phase": phase,
+        "expectedSeconds": status.get("expectedSeconds"),
+        "elapsed": round(max(elapsed, 0.0), 1),
+        "error": status.get("error"),
+    }
+
+
+@app.post("/cutout-jobs", status_code=202)
+async def create_cutout_job(
+    image: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
+    """写真を預けて受付番号をもらう。切り抜きはあとで（/cutout-jobs/{id} を見に来る）。
+
+    認証・画像の検証・回数は /cutouts と同じ。受け付けたら入力を GCS に置き、
+    Cloud Tasks に処理を積んで 202 で返る。積めなければ回数を戻して 503
+    """
+    uid, _email = _identity_from_token(authorization)
+    if not (_tasks and SELF_URL and TASK_SERVICE_ACCOUNT):
+        raise HTTPException(status_code=503, detail="預かる仕組みが設定されていない")
+
+    data = await image.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="画像が空")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"画像は {MAX_IMAGE_BYTES // (1024 * 1024)}MB まで。"
+                   f"受け取ったのは {len(data) / (1024 * 1024):.1f}MB",
+        )
+    img = _decode_image(data)
+    _consume_quota(uid)
+
+    job_id = uuid.uuid4().hex
+    expected = round(_expected_inference_seconds(), 1)
+    try:
+        # HEIC でも向きが違っても、処理側は JPEG を開くだけで済むようにしておく
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=INPUT_JPEG_QUALITY)
+        _job_blob(uid, job_id, "input.jpg").upload_from_string(buf.getvalue(), content_type="image/jpeg")
+        _write_status(uid, job_id, {"phase": "queued", "createdAt": _now(), "expectedSeconds": expected})
+        _enqueue_run(uid, job_id)
+    except Exception as e:
+        _restore_quota(uid)
+        raise HTTPException(status_code=503, detail=f"預かれなかった: {e}")
+    return {"id": job_id, "expectedSeconds": expected}
+
+
+@app.post("/cutout-jobs/{uid}/{job_id}/run")
+async def run_cutout_job(
+    uid: str,
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    """預かった 1 件を処理する。Cloud Tasks だけが叩く（OIDC トークンで確かめる）。
+
+    Cloud Tasks は 2xx 以外を再試行する。推論そのものの失敗はやり直しても同じなので
+    status を failed にして 200 で返す。処理中に落ちた（インスタンスが消えた等）なら
+    再試行で来るので、done でなければやり直す
+    """
+    _verify_task_token(authorization)
+    status = _read_status(uid, job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="預かりが無い")
+    if status["phase"] in ("done", "failed"):
+        return {"phase": status["phase"]}
+
+    started = _now()
+    _write_status(uid, job_id, {**status, "phase": "running", "startedAt": started})
+    try:
+        img = Image.open(io.BytesIO(_job_blob(uid, job_id, "input.jpg").download_as_bytes()))
+        img.load()
+        img = img.convert("RGB")
+        mask = await asyncio.to_thread(_timed_predict_mask, img)
+        png = await asyncio.to_thread(_finish, img, mask)
+        _job_blob(uid, job_id, "result.png").upload_from_string(png, content_type="image/png")
+        _write_status(uid, job_id, {**status, "phase": "done", "startedAt": started, "finishedAt": _now()})
+        return {"phase": "done"}
+    except Exception as e:
+        # こちら都合の失敗は回数に数えない
+        _restore_quota(uid)
+        _write_status(uid, job_id, {**status, "phase": "failed", "startedAt": started, "error": f"切り抜きに失敗: {e}"})
+        return {"phase": "failed"}
+
+
+@app.get("/cutout-jobs/{job_id}")
+def get_cutout_job(job_id: str, authorization: str | None = Header(default=None)):
+    """預けた 1 件の状態。自分の分しか見えない（uid はトークンから）。"""
+    uid, _email = _identity_from_token(authorization)
+    status = _read_status(uid, job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="預かりが無い")
+    return _public_status(status)
+
+
+@app.get("/cutout-jobs/{job_id}/result")
+def get_cutout_result(job_id: str, authorization: str | None = Header(default=None)):
+    """できあがった切り抜き（透過 PNG）。done になるまでは 404。"""
+    uid, _email = _identity_from_token(authorization)
+    status = _read_status(uid, job_id)
+    if status is None or status["phase"] != "done":
+        raise HTTPException(status_code=404, detail="まだできていない")
+    return Response(content=_job_blob(uid, job_id, "result.png").download_as_bytes(), media_type="image/png")
