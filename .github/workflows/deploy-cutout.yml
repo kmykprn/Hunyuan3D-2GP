@@ -78,8 +78,8 @@ jobs:
       - name: 新しいリビジョンが応答するか
         run: |
           URL=$(gcloud run services describe "$SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')
-          # 認証無しの POST /cutouts は 401 が正しい（画像を付けて本文の検証を通す）。
+          # 認証無しの POST /cutout-jobs は 401 が正しい（画像を付けて本文の検証を通す）。
           # 5xx や接続失敗なら起動に失敗している
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' -F "image=@README.md" "$URL/cutouts")
-          echo "POST /cutouts (no auth) -> $CODE"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -F "image=@README.md" "$URL/cutout-jobs")
+          echo "POST /cutout-jobs (no auth) -> $CODE"
           test "$CODE" = "401"

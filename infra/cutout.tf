@@ -23,9 +23,18 @@ resource "google_storage_bucket" "cutout_state" {
   uniform_bucket_level_access = true
   public_access_prevention    = "enforced"
 
-  # カウンタは日付ごとに別ファイル、預かりは取りに来たら用済み。古いものは消してよい
+  # カウンタは日付ごとに別ファイルなので、古い日のものは消してよい
   lifecycle_rule {
     condition { age = 7 }
+    action { type = "Delete" }
+  }
+
+  # 預かった切り抜きは、画面が取りに来たら用済み。閉じたまま 2 日放置されたら諦める
+  lifecycle_rule {
+    condition {
+      age            = 2
+      matches_prefix = ["jobs/"]
+    }
     action { type = "Delete" }
   }
 
@@ -102,9 +111,11 @@ resource "google_cloud_run_v2_service" "cutout" {
     # 1 件 6 秒（処理の /run はモデルの読み込み込みで 30 秒ほど）。60 秒あれば十分
     timeout = "60s"
 
-    # 推論は 1 件で 6.4GB 使う。2 件同時に受けるとメモリが足りない。
-    # 並列は台数で取る（max_instance_count）
-    max_instance_request_concurrency = 1
+    # 推論は 1 件で 6.4GB 使うので同時に 1 つだが、それはコードの側で守る
+    # （/run が重なれば 429 で Cloud Tasks に再試行させる）。ここを 1 にすると、
+    # 推論中に来る状態確認の GET のために 2 台目が起動して、起動 20 秒ぶんの費用がかかる。
+    # 状態確認は軽いので、同じ台が推論の合間に返せばよい
+    max_instance_request_concurrency = 8
 
     scaling {
       min_instance_count = 0

@@ -11,22 +11,21 @@
 # 置き、Cloud Tasks に「この 1 件を処理せよ」を積んで、すぐ受付番号を返す。処理は
 # Cloud Tasks がこのサービス自身の /run を叩いて行う（別のリクエストなので CPU が付く）。
 # 画面は受付番号で状態を見に来る。iPhone は PWA を裏に回すと数秒で通信を切るので、
-# 1 本の接続で 30〜50 秒待たせる形（旧 /cutouts）は、URL をコピーしに行く間に切れていた。
+# 1 本の接続で 30〜50 秒待たせる形（旧 /cutouts、消した）は、URL をコピーしに行く間に切れていた。
 
 import asyncio
-import base64
 import collections
 import datetime
 import io
 import json
 import os
+import threading
 import time
 import uuid
 
 import firebase_admin
 import pillow_heif
 from fastapi import FastAPI, File, Header, HTTPException, Response, UploadFile
-from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth as fb_auth
 from google.api_core.exceptions import NotFound, PreconditionFailed
@@ -89,10 +88,10 @@ MAX_EDGE = 1024
 RECENT_INFERENCE_SECONDS: collections.deque[float] = collections.deque(maxlen=5)
 DEFAULT_INFERENCE_SECONDS = 8.0
 
-# 流している途中で黙る時間の上限。推論は 10〜20 秒黙るが、応答のヘッダを送ったあとに
-# 無通信が続くと、途中の経路（iPhone では HTTP/3）が応答を閉じてしまうことがあった。
-# その間も同じ工程の行を繰り返し流して、接続が生きていることを示す
-HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", "2"))
+# 推論は同時に 1 つ（1 件で 6.4GB 使う。2 つ走るとメモリが足りない）。
+# サービスの同時リクエスト数は 8 にしてあり、状態確認の GET は推論の合間に同じ台が返す。
+# /run が重なったら 429 を返し、Cloud Tasks に少し後で再試行させる
+_inference_slot = threading.Lock()
 
 app = FastAPI()
 
@@ -242,25 +241,6 @@ def _finish(img: Image.Image, mask: Image.Image) -> bytes:
     return to_png(crop_to_content(rgba))
 
 
-def _event(phase: str, **fields) -> bytes:
-    """応答の 1 行。NDJSON（1 行 1 JSON）。"""
-    return (json.dumps({"phase": phase, **fields}) + "\n").encode()
-
-
-async def _heartbeat_until(task: asyncio.Future, event):
-    """task が終わるまで、HEARTBEAT_SECONDS ごとに event(経過秒) の行を流す。
-
-    行を流すのは接続を黙らせないため。画面側は同じ工程の行が繰り返し来ても
-    円の基準時刻を動かさない（経過秒は行の中に入れて渡す）。結果は呼び出し側が task から取る
-    """
-    started = time.perf_counter()
-    while True:
-        finished, _ = await asyncio.wait({task}, timeout=HEARTBEAT_SECONDS)
-        if finished:
-            return
-        yield event(round(time.perf_counter() - started, 1))
-
-
 # --- 入口 ---------------------------------------------------------------
 
 
@@ -268,80 +248,6 @@ async def _heartbeat_until(task: asyncio.Future, event):
 @app.get("/health")
 def health():
     return {"ok": True}
-
-
-@app.post("/cutouts")
-async def create_cutout(
-    image: UploadFile = File(...),
-    authorization: str | None = Header(default=None),
-    accept: str | None = Header(default=None),
-):
-    """切り抜く。Accept が application/x-ndjson なら工程を 1 行ずつ流し、そうでなければ PNG を返す（SPEC.md）。
-
-    2 通りあるのは切り替えの順序のため。配信済みの画面は PNG を待っているので、
-    先にサーバーを流す形だけにすると、画面を更新するまでの間ずっと失敗する。
-    画面が NDJSON を読めるようになったら PNG の形は消してよい。
-
-    推論そのものは途中経過を出せない（onnxruntime の中で止まる）ので、流せるのは
-    「受け付けた → 推論中（見込み秒数つき）→ 仕上げ → 完成」の 4 つ。
-    それでも、1 行目が届くまでが「起動待ち」だと画面側で区別できる。
-    コールドスタートで 15 秒黙っている間、画面が嘘の円を出さずに済む。
-
-    認証・画像の検証・回数は、ストリームを始める前に普通の HTTP エラーで返す。
-    始めたあとの失敗は最後の行（failed）で伝える。ヘッダはもう送ってしまっているため
-    """
-    uid, _email = _identity_from_token(authorization)
-
-    data = await image.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="画像が空")
-    if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"画像は {MAX_IMAGE_BYTES // (1024 * 1024)}MB まで。"
-                   f"受け取ったのは {len(data) / (1024 * 1024):.1f}MB",
-        )
-    # 数える前に弾く。読めない画像で回数を減らさない
-    img = _decode_image(data)
-
-    # 推論の前に数える。後で数えると、同時に投げられた分が全部通ってしまう
-    _consume_quota(uid)
-
-    if "application/x-ndjson" not in (accept or ""):
-        try:
-            mask = await asyncio.to_thread(_timed_predict_mask, img)
-            png = await asyncio.to_thread(_finish, img, mask)
-        except Exception:
-            # こちら都合の失敗は回数に数えない
-            _restore_quota(uid)
-            raise
-        return Response(content=png, media_type="image/png")
-
-    async def stream():
-        try:
-            yield _event("received")
-            expected = round(_expected_inference_seconds(), 1)
-            yield _event("cutting", expectedSeconds=expected, elapsed=0)
-            # 推論は数秒ブロックする。イベントループを止めないよう別スレッドで走らせ、
-            # その間は同じ行を繰り返し流す（黙ると接続を閉じられることがある）
-            predicting = asyncio.ensure_future(asyncio.to_thread(_timed_predict_mask, img))
-            async for line in _heartbeat_until(
-                predicting, lambda s: _event("cutting", expectedSeconds=expected, elapsed=s)
-            ):
-                yield line
-            mask = predicting.result()
-            yield _event("finishing", elapsed=0)
-            finishing = asyncio.ensure_future(asyncio.to_thread(_finish, img, mask))
-            async for line in _heartbeat_until(finishing, lambda s: _event("finishing", elapsed=s)):
-                yield line
-            png = finishing.result()
-            yield _event("done", png=base64.b64encode(png).decode())
-        except Exception as e:
-            # こちら都合の失敗は回数に数えない
-            _restore_quota(uid)
-            yield _event("failed", error=f"切り抜きに失敗: {e}")
-
-    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 # --- 預ける形（/cutout-jobs） ------------------------------------------------
@@ -489,22 +395,28 @@ async def run_cutout_job(
     if status["phase"] in ("done", "failed"):
         return {"phase": status["phase"]}
 
-    started = _now()
-    _write_status(uid, job_id, {**status, "phase": "running", "startedAt": started})
+    # 推論の枠が空いていなければ待たずに 429。Cloud Tasks が数秒後に持ってくる
+    if not _inference_slot.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="別の切り抜きを処理中")
     try:
-        img = Image.open(io.BytesIO(_job_blob(uid, job_id, "input.jpg").download_as_bytes()))
-        img.load()
-        img = img.convert("RGB")
-        mask = await asyncio.to_thread(_timed_predict_mask, img)
-        png = await asyncio.to_thread(_finish, img, mask)
-        _job_blob(uid, job_id, "result.png").upload_from_string(png, content_type="image/png")
-        _write_status(uid, job_id, {**status, "phase": "done", "startedAt": started, "finishedAt": _now()})
-        return {"phase": "done"}
-    except Exception as e:
-        # こちら都合の失敗は回数に数えない
-        _restore_quota(uid)
-        _write_status(uid, job_id, {**status, "phase": "failed", "startedAt": started, "error": f"切り抜きに失敗: {e}"})
-        return {"phase": "failed"}
+        started = _now()
+        _write_status(uid, job_id, {**status, "phase": "running", "startedAt": started})
+        try:
+            img = Image.open(io.BytesIO(_job_blob(uid, job_id, "input.jpg").download_as_bytes()))
+            img.load()
+            img = img.convert("RGB")
+            mask = await asyncio.to_thread(_timed_predict_mask, img)
+            png = await asyncio.to_thread(_finish, img, mask)
+            _job_blob(uid, job_id, "result.png").upload_from_string(png, content_type="image/png")
+            _write_status(uid, job_id, {**status, "phase": "done", "startedAt": started, "finishedAt": _now()})
+            return {"phase": "done"}
+        except Exception as e:
+            # こちら都合の失敗は回数に数えない
+            _restore_quota(uid)
+            _write_status(uid, job_id, {**status, "phase": "failed", "startedAt": started, "error": f"切り抜きに失敗: {e}"})
+            return {"phase": "failed"}
+    finally:
+        _inference_slot.release()
 
 
 @app.get("/cutout-jobs/{job_id}")
