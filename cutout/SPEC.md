@@ -25,7 +25,7 @@ GET {cutout_url}/cutout-jobs/{id}?wait=25&after=queued
 Authorization: Bearer <Firebase ID トークン>
 
 200 {"phase": "queued" | "running" | "done" | "failed", "expectedSeconds": 6.4, "elapsed": 3.2, "error": null}
-404 … 無い・他人のもの・消えた（2 日）
+404 … 無い・他人のもの・消えた（1 日）
 ```
 
 `wait`（秒、上限 25）を付けると、工程が `after` から変わるか done / failed になるまでサーバーで
