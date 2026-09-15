@@ -21,12 +21,19 @@ Content-Type: multipart/form-data; image=<JPEG / PNG / WebP / HEIC, 5MB まで>
 429 … 本日の上限（既定 50 枚）に達した
 503 … 預かる仕組み（Cloud Tasks）が設定されていない・積めなかった。回数は戻す
 
-GET {cutout_url}/cutout-jobs/{id}
+GET {cutout_url}/cutout-jobs/{id}?wait=25&after=queued
 Authorization: Bearer <Firebase ID トークン>
 
 200 {"phase": "queued" | "running" | "done" | "failed", "expectedSeconds": 6.4, "elapsed": 3.2, "error": null}
 404 … 無い・他人のもの・消えた（2 日）
+```
 
+`wait`（秒、上限 25）を付けると、工程が `after` から変わるか done / failed になるまでサーバーで
+待ってから返す。画面は「いま知っている工程」を `after` に入れて叩くので、1 件あたり
+起動待ち → 推論中 → 完成の変わり目ごとに 1 回、計 3 回ほどで済む。待っている間に画面が
+裏に回って切れても、状態は GCS にあるので戻ってからもう一度叩けばよい。
+
+```
 GET {cutout_url}/cutout-jobs/{id}/result
 200 image/png … 透明な余白は切り落としてある（長辺 1024px まで）
 404 … まだ done でない

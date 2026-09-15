@@ -180,6 +180,23 @@ alpha = np.asarray(out.getchannel("A"))
 check("中央は不透明、隅は透明", alpha[out.height // 2, out.width // 2] == 255 and alpha[0, 0] < 8)
 check("done のあと /run が再び来ても処理しない", run_job("u1", job_id).json()["phase"] == "done")
 
+# --- 状態確認で待つ ---
+reset(); fake_tasks.tasks.clear()
+job_id = post_job().json()["id"]
+import threading as _threading, time as _time
+t0 = _time.monotonic()
+check("after が今の工程なら wait の間待って返す", status_of(job_id).status_code == 200 and client.get(f"/cutout-jobs/{job_id}?wait=0.3&after=queued", headers=headers()).json()["phase"] == "queued" and _time.monotonic() - t0 >= 0.3)
+t0 = _time.monotonic()
+check("after が違えばすぐ返す", client.get(f"/cutout-jobs/{job_id}?wait=5&after=running", headers=headers()).json()["phase"] == "queued" and _time.monotonic() - t0 < 1.0)
+with mock.patch.object(main, "WAIT_POLL_SECONDS", 0.05):
+    def finish_later():
+        _time.sleep(0.2); run_job("u1", job_id)
+    _threading.Thread(target=finish_later).start()
+    t0 = _time.monotonic()
+    st = client.get(f"/cutout-jobs/{job_id}?wait=5&after=queued", headers=headers()).json()
+check("待っている間に変われば、その時点で返す", st["phase"] in ("running", "done") and _time.monotonic() - t0 < 3.0)
+check("wait の上限は 25 秒", main.MAX_WAIT_SECONDS == 25.0)
+
 # --- 推論の枠は 1 つ ---
 reset(); fake_tasks.tasks.clear()
 job_id = post_job().json()["id"]
