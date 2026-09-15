@@ -15,7 +15,7 @@ resource "google_service_account" "cutout" {
   depends_on = [google_project_service.required]
 }
 
-# 1 日の回数を数えるファイルの置き場。数 KB × 利用者数しか無い
+# 回数のカウンタと、預かった切り抜き（入力 200KB・結果 400KB × 件数）の置き場
 resource "google_storage_bucket" "cutout_state" {
   name     = "${var.project_id}-cutout-state"
   location = upper(var.region)
@@ -23,7 +23,7 @@ resource "google_storage_bucket" "cutout_state" {
   uniform_bucket_level_access = true
   public_access_prevention    = "enforced"
 
-  # カウンタは日付ごとに別ファイルなので、古い日のものは消してよい
+  # カウンタは日付ごとに別ファイル、預かりは取りに来たら用済み。古いものは消してよい
   lifecycle_rule {
     condition { age = 7 }
     action { type = "Delete" }
@@ -38,10 +38,55 @@ resource "google_storage_bucket_iam_member" "cutout_rw_state" {
   member = "serviceAccount:${google_service_account.cutout.email}"
 }
 
+# 預かった切り抜きの処理を積む順番待ち。
+#
+# 切り抜きは「預けて、あとで取りに行く」形（cutout/SPEC.md の /cutout-jobs）。受け付けの
+# リクエストはすぐ返し、処理は Cloud Tasks がこのサービス自身の /run を叩いて行う。
+# 応答を返したあとの処理はリクエストに紐づかず CPU が付かないので、別のリクエストにする。
+# 費用は無料枠（月 100 万件）に収まる
+resource "google_cloud_tasks_queue" "cutout" {
+  name     = "cutout"
+  location = var.region
+
+  rate_limits {
+    # 同時に処理するのはサービスの台数まで。それ以上積んでも 429 で待たされるだけ
+    max_concurrent_dispatches = 2
+    max_dispatches_per_second = 5
+  }
+
+  retry_config {
+    # 処理側は推論の失敗を failed として 200 で返す。再試行が要るのは
+    # 台数の上限で弾かれたときと、処理中にインスタンスが消えたときだけ
+    max_attempts  = 5
+    min_backoff   = "5s"
+    max_backoff   = "60s"
+    max_doublings = 3
+  }
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_cloud_tasks_queue_iam_member" "cutout_enqueues" {
+  name     = google_cloud_tasks_queue.cutout.name
+  location = var.region
+  role     = "roles/cloudtasks.enqueuer"
+  member   = "serviceAccount:${google_service_account.cutout.email}"
+}
+
+# 積む処理に自分の OIDC トークンを付けるには、自分自身を「使う」権限が要る
+resource "google_service_account_iam_member" "cutout_acts_as_self" {
+  service_account_id = google_service_account.cutout.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.cutout.email}"
+}
+
 # 推論に使う CPU 数。resources と INFERENCE_THREADS の両方に同じ値を入れる。
 # コンテナの中で os.cpu_count() を見るとホストの CPU 数が返るので、ここから渡す
 locals {
   cutout_cpu = 4
+  # サービス自身の URL。Cloud Run の決定的な URL（サービス名-プロジェクト番号）。
+  # サービスの属性から取ると自分自身を参照する循環になるので、形から組む
+  cutout_self_url = "https://cutout-${data.google_project.this.number}.${var.region}.run.app"
 }
 
 resource "google_cloud_run_v2_service" "cutout" {
@@ -54,7 +99,7 @@ resource "google_cloud_run_v2_service" "cutout" {
   template {
     service_account = google_service_account.cutout.email
 
-    # 1 件 6 秒。60 秒あれば十分で、それ以上は何かが壊れている
+    # 1 件 6 秒（処理の /run はモデルの読み込み込みで 30 秒ほど）。60 秒あれば十分
     timeout = "60s"
 
     # 推論は 1 件で 6.4GB 使う。2 件同時に受けるとメモリが足りない。
@@ -85,6 +130,18 @@ resource "google_cloud_run_v2_service" "cutout" {
       env {
         name  = "INFERENCE_THREADS"
         value = tostring(local.cutout_cpu)
+      }
+      env {
+        name  = "TASK_QUEUE"
+        value = google_cloud_tasks_queue.cutout.id
+      }
+      env {
+        name  = "SELF_URL"
+        value = local.cutout_self_url
+      }
+      env {
+        name  = "TASK_SERVICE_ACCOUNT"
+        value = google_service_account.cutout.email
       }
 
       resources {

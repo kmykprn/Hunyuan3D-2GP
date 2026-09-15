@@ -1,10 +1,54 @@
 # 切り抜き API
 
-写真から家具だけを切り抜いて、透過 PNG を返す。roomplanner-web の「写真から家具を作る」が叩く。
+写真から家具だけを切り抜いて、透過 PNG を返す。roomplanner-web の「作る」（写真から・商品の URL から）が叩く。
 
-3D 生成（`api/`）と違い、**同期で数秒で返る**。ジョブも待機列も無い。
+**預けて、あとで取りに行く**形（`/cutout-jobs`）。3D 生成（`api/`）と同じ考え方で、
+受け付けたらすぐ受付番号を返し、処理はサーバー側で進む。画面は受付番号で状態を見に来る。
+iPhone は PWA を裏に回すと数秒で通信を切るので、1 本の接続で 30〜50 秒待たせる形（旧 `/cutouts`）は
+楽天のページに URL をコピーしに行く間に切れていた。
 
 ## 入口
+
+```
+POST {cutout_url}/cutout-jobs
+Authorization: Bearer <Firebase ID トークン>
+Content-Type: multipart/form-data; image=<JPEG / PNG / WebP / HEIC, 5MB まで>
+
+202 {"id": "<受付番号>", "expectedSeconds": 6.4}
+400 … 画像が読めない・対応外の形式・5MB 超。回数は数えない
+401 … トークンが無い・無効・Google に紐づいていない
+409 … 同時に処理された。やり直せばよい
+429 … 本日の上限（既定 50 枚）に達した
+503 … 預かる仕組み（Cloud Tasks）が設定されていない・積めなかった。回数は戻す
+
+GET {cutout_url}/cutout-jobs/{id}
+Authorization: Bearer <Firebase ID トークン>
+
+200 {"phase": "queued" | "running" | "done" | "failed", "expectedSeconds": 6.4, "elapsed": 3.2, "error": null}
+404 … 無い・他人のもの・消えた（7 日）
+
+GET {cutout_url}/cutout-jobs/{id}/result
+200 image/png … 透明な余白は切り落としてある（長辺 1024px まで）
+404 … まだ done でない
+```
+
+`elapsed` はサーバーの時計で測った、いまの工程に入ってからの秒数（queued は受付から、
+running は処理開始から）。端末の時計とずれても円の進み方が狂わないよう、画面はこれを使う。
+`expectedSeconds` は推論の直近 5 回の平均。
+
+### 処理の流れ
+
+1. 受付: 検証 → 回数を数える → 入力を `jobs/{uid}/{id}/input.jpg` に置く（長辺 1024・向きを直した JPEG）
+   → `status.json` を queued で書く → Cloud Tasks に `POST /cutout-jobs/{uid}/{id}/run` を積む → 202
+2. 処理（Cloud Tasks がこのサービス自身を叩く。別のリクエストなので CPU が付く）:
+   running → 推論 → `result.png` → done。推論の失敗は failed にして **200 で返す**（やり直しても同じ。回数は戻す）。
+   台数の上限（429/503）や処理中の消滅は Cloud Tasks が再試行する。done / failed なら何もしない
+3. `/run` は Cloud Tasks が付ける OIDC トークン（サービスアカウント、audience はサービスの URL）を検証し、
+   それ以外は 403。環境変数 `TASK_QUEUE` / `SELF_URL` / `TASK_SERVICE_ACCOUNT` は Terraform（infra/cutout.tf）が入れる
+
+### 旧: 1 本の接続で待つ形（消してよい）
+
+画面が `/cutout-jobs` に切り替わったら消す。
 
 ```
 POST {cutout_url}/cutouts

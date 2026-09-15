@@ -68,6 +68,8 @@ resource "google_project_service" "required" {
     "iamcredentials.googleapis.com",
     # GitHub Actions が Workload Identity 連携でトークンを引き換えるのに要る（deploy.tf）
     "sts.googleapis.com",
+    # 切り抜きサービスが預かった 1 件の処理を積む順番待ち（cutout.tf）
+    "cloudtasks.googleapis.com",
   ])
 
   service            = each.value
